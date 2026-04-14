@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import Image from "next/image";
 import { supabase } from "@/lib/supabase";
@@ -28,10 +28,12 @@ export default function QueuePage() {
   const [activeSession, setActiveSession] = useState<ActiveSession | null>(
     null,
   );
-  const [checkingSession, setCheckingSession] = useState(true);
+  const [checkingSession, setCheckingSession] = useState(false);
 
-  const fetchActiveSession = async () => {
-    setCheckingSession(true);
+  const pollRef = useRef<NodeJS.Timeout | null>(null);
+
+  const fetchActiveSession = async (silent = false) => {
+    if (!silent) setCheckingSession(true);
 
     const { data, error } = await supabase
       .from("queue_sessions")
@@ -44,15 +46,21 @@ export default function QueuePage() {
     if (error) {
       console.error("fetchActiveSession error:", error.message);
       setActiveSession(null);
-      setCheckingSession(false);
-      return;
+      if (!silent) setCheckingSession(false);
+      return null;
     }
 
-    setActiveSession((data as ActiveSession | null) || null);
-    setCheckingSession(false);
+    const session = (data as ActiveSession | null) || null;
+    setActiveSession(session);
+
+    if (!silent) setCheckingSession(false);
+    return session;
   };
 
   useEffect(() => {
+    let visibilityHandler: (() => void) | null = null;
+
+    setCheckingSession(true);
     fetchActiveSession();
 
     const channel = supabase
@@ -61,12 +69,36 @@ export default function QueuePage() {
         "postgres_changes",
         { event: "*", schema: "public", table: "queue_sessions" },
         () => {
-          fetchActiveSession();
+          fetchActiveSession(true);
         },
       )
-      .subscribe();
+      .subscribe((status) => {
+        console.log("Realtime status:", status);
+      });
+
+    pollRef.current = setInterval(() => {
+      fetchActiveSession(true);
+    }, 3000);
+
+    const onFocus = () => {
+      fetchActiveSession(true);
+    };
+
+    visibilityHandler = () => {
+      if (document.visibilityState === "visible") {
+        fetchActiveSession(true);
+      }
+    };
+
+    window.addEventListener("focus", onFocus);
+    document.addEventListener("visibilitychange", visibilityHandler);
 
     return () => {
+      if (pollRef.current) clearInterval(pollRef.current);
+      window.removeEventListener("focus", onFocus);
+      if (visibilityHandler) {
+        document.removeEventListener("visibilitychange", visibilityHandler);
+      }
       supabase.removeChannel(channel);
     };
   }, []);
@@ -76,18 +108,46 @@ export default function QueuePage() {
     setLoading(true);
     setError("");
 
-    const { error: loginError } = await supabase.auth.signInWithPassword({
-      email,
-      password,
-    });
+    try {
+      console.log("Starting admin login with email:", email);
 
-    if (loginError) {
-      setError("Login gagal! Periksa email dan password.");
+      const { data, error: loginError } =
+        await supabase.auth.signInWithPassword({
+          email,
+          password,
+        });
+
+      if (loginError) {
+        console.error("Login error:", loginError);
+        setError(
+          "Login gagal! Periksa email dan password. Error: " +
+            loginError.message,
+        );
+        setLoading(false);
+        return;
+      }
+
+      console.log("Login successful, user:", data.user?.email);
+
+      // Clear email and password after successful login
+      setEmail("");
+      setPassword("");
       setLoading(false);
-      return;
-    }
 
-    router.push("/admin");
+      console.log("Navigating to admin page...");
+      // Navigate to admin page with better error handling
+      try {
+        await router.push("/admin");
+        console.log("Navigation successful");
+      } catch (navError) {
+        console.error("Navigation error, trying replace:", navError);
+        await router.replace("/admin");
+      }
+    } catch (err: any) {
+      console.error("Login exception:", err);
+      setError("Terjadi kesalahan: " + (err.message || "Unknown error"));
+      setLoading(false);
+    }
   };
 
   const handleSubmit = async (e: React.FormEvent) => {
@@ -102,17 +162,9 @@ export default function QueuePage() {
     setLoading(true);
 
     try {
-      const { data: sessionData, error: sessionError } = await supabase
-        .from("queue_sessions")
-        .select("id, title")
-        .eq("status", "active")
-        .order("started_at", { ascending: false })
-        .limit(1)
-        .maybeSingle();
+      const latestSession = await fetchActiveSession(true);
 
-      if (sessionError) throw sessionError;
-
-      if (!sessionData) {
+      if (!latestSession) {
         throw new Error(
           "Sesi belum dimulai. Silakan tunggu admin membuka sesi.",
         );
@@ -134,7 +186,7 @@ export default function QueuePage() {
       const { data: lastQueue, error: lastQueueError } = await supabase
         .from("queues")
         .select("queue_number")
-        .eq("session_id", sessionData.id)
+        .eq("session_id", latestSession.id)
         .order("queue_number", { ascending: false })
         .limit(1)
         .maybeSingle();
@@ -148,7 +200,7 @@ export default function QueuePage() {
         .insert([
           {
             user_id: user.id,
-            session_id: sessionData.id,
+            session_id: latestSession.id,
             queue_number: nextQueueNumber,
             status: "pending_confirmation",
             price: 0,
@@ -169,6 +221,8 @@ export default function QueuePage() {
       setLoading(false);
     }
   };
+
+  const isSubmitDisabled = isAdminLogin ? loading : loading || checkingSession;
 
   return (
     <div className="min-h-screen bg-[#050505] text-slate-200 font-sans overflow-x-hidden selection:bg-purple-500/30">
@@ -212,11 +266,13 @@ export default function QueuePage() {
             </div>
 
             <button
+              type="button"
               onClick={() => {
                 setIsAdminLogin(!isAdminLogin);
                 setError("");
+                setLoading(false);
               }}
-              className="inline-flex items-center gap-2 rounded-2xl border border-white/10 bg-white/5 px-4 py-3 text-[10px] font-black uppercase tracking-[0.24em] text-slate-400 hover:text-white hover:bg-white/10 transition-all"
+              className="relative z-30 pointer-events-auto inline-flex items-center gap-2 rounded-2xl border border-white/10 bg-white/5 px-4 py-3 text-[10px] font-black uppercase tracking-[0.24em] text-slate-400 hover:text-white hover:bg-white/10 transition-all active:scale-95"
             >
               <svg
                 className="w-4 h-4"
@@ -265,20 +321,31 @@ export default function QueuePage() {
                       Mengecek sesi aktif...
                     </p>
                   </div>
+                ) : activeSession ? (
+                  <div className="rounded-4xl border border-green-500/20 bg-green-500/8 p-5">
+                    <p className="text-[10px] font-black uppercase tracking-[0.24em] text-green-400 mb-2">
+                      Sesi Aktif
+                    </p>
+                    <p className="text-xl font-black text-white tracking-tight">
+                      {activeSession.title}
+                    </p>
+                    <p className="mt-2 text-xs text-slate-400 leading-relaxed">
+                      Nomor antrian akan dimulai dari 1 untuk sesi ini.
+                    </p>
+                  </div>
                 ) : (
-                  activeSession && (
-                    <div className="rounded-4xl border border-green-500/20 bg-green-500/8 p-5">
-                      <p className="text-[10px] font-black uppercase tracking-[0.24em] text-green-400 mb-2">
-                        Sesi Aktif
-                      </p>
-                      <p className="text-xl font-black text-white tracking-tight">
-                        {activeSession.title}
-                      </p>
-                      <p className="mt-2 text-xs text-slate-400 leading-relaxed">
-                        Nomor antrian akan dimulai dari 1 untuk sesi ini.
-                      </p>
-                    </div>
-                  )
+                  <div className="rounded-4xl border border-red-500/20 bg-red-500/8 p-5">
+                    <p className="text-[10px] font-black uppercase tracking-[0.24em] text-red-400 mb-2">
+                      Session Status
+                    </p>
+                    <p className="text-base font-black text-white">
+                      Belum ada sesi aktif
+                    </p>
+                    <p className="mt-2 text-xs text-slate-400 leading-relaxed">
+                      Tunggu admin memulai sesi. Halaman ini akan update
+                      otomatis.
+                    </p>
+                  </div>
                 )}
               </div>
 
@@ -390,7 +457,9 @@ export default function QueuePage() {
                         ? "Masuk untuk mengelola daftar antrian dan status pelanggan."
                         : activeSession
                           ? "Isi data singkat Anda lalu dapatkan tiket antrian secara instan."
-                          : "Saat ini belum ada sesi aktif. Silakan tunggu admin membuka sesi."}
+                          : checkingSession
+                            ? "Sedang mengecek sesi aktif."
+                            : "Saat ini belum ada sesi aktif. Silakan tunggu admin membuka sesi."}
                     </p>
                   </div>
 
@@ -447,7 +516,8 @@ export default function QueuePage() {
 
                     <button
                       type="submit"
-                      disabled={loading || (!isAdminLogin && !activeSession)}
+                      disabled={isSubmitDisabled}
+                      suppressHydrationWarning
                       className={`w-full rounded-2xl py-5 font-black uppercase tracking-[0.22em] transition-all duration-300 shadow-2xl active:scale-[0.98] disabled:opacity-50 disabled:cursor-not-allowed ${
                         isAdminLogin
                           ? "bg-white text-black hover:bg-slate-200 shadow-white/5"
@@ -458,9 +528,9 @@ export default function QueuePage() {
                         ? "Processing..."
                         : isAdminLogin
                           ? "Authenticate"
-                          : activeSession
-                            ? "Get My Ticket"
-                            : "Session Not Active"}
+                          : checkingSession
+                            ? "Checking Session..."
+                            : "Get My Ticket"}
                     </button>
                   </form>
 

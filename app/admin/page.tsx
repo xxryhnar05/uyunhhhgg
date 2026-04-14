@@ -236,35 +236,122 @@ export default function AdminPage() {
   };
 
   useEffect(() => {
-    refreshPageData();
+    let mounted = true;
+    let subscription: any = null;
 
-    pollIntervalRef.current = setInterval(() => {
-      refreshPageData();
-    }, 2000);
+    const setupAuthListener = async () => {
+      try {
+        console.log("Admin page: Checking authentication...");
 
-    const channel = supabase
-      .channel("queues-admin-and-sessions")
-      .on(
-        "postgres_changes",
-        { event: "*", schema: "public", table: "queues" },
-        () => {
-          refreshPageData();
-        },
-      )
-      .on(
-        "postgres_changes",
-        { event: "*", schema: "public", table: "queue_sessions" },
-        () => {
-          refreshPageData();
-        },
-      )
-      .subscribe();
+        // First, check current session
+        const {
+          data: { session },
+          error: sessionError,
+        } = await supabase.auth.getSession();
+
+        if (!mounted) {
+          console.log("Admin page: Component unmounted, skipping");
+          return;
+        }
+
+        console.log("Admin page: Session check result:", {
+          session: session?.user?.email,
+          error: sessionError,
+        });
+
+        if (sessionError) {
+          console.error("Admin page: Session check error:", sessionError);
+          try {
+            await router.push("/queue");
+          } catch (err) {
+            console.error("Admin page: Navigation error", err);
+            window.location.href = "/queue";
+          }
+          return;
+        }
+
+        if (!session) {
+          console.log(
+            "Admin page: No session found in first check, waiting 500ms...",
+          );
+          // Wait a bit for session to be established
+          await new Promise((resolve) => setTimeout(resolve, 500));
+
+          const {
+            data: { session: session2 },
+            error: error2,
+          } = await supabase.auth.getSession();
+          console.log("Admin page: Second session check result:", {
+            session: session2?.user?.email,
+            error: error2,
+          });
+
+          if (!session2) {
+            console.log(
+              "Admin page: Still no session after wait, redirecting to login",
+            );
+            try {
+              await router.push("/queue");
+            } catch (err) {
+              console.error("Admin page: Navigation error", err);
+              window.location.href = "/queue";
+            }
+            return;
+          }
+        }
+
+        // Session exists or was established, load data
+        if (mounted) {
+          console.log("Admin page: Session confirmed, loading data...");
+          await refreshPageData();
+
+          pollIntervalRef.current = setInterval(async () => {
+            await refreshPageData();
+          }, 2000);
+
+          const channel = supabase
+            .channel("queues-admin-and-sessions")
+            .on(
+              "postgres_changes",
+              { event: "*", schema: "public", table: "queues" },
+              () => {
+                refreshPageData();
+              },
+            )
+            .on(
+              "postgres_changes",
+              { event: "*", schema: "public", table: "queue_sessions" },
+              () => {
+                refreshPageData();
+              },
+            )
+            .subscribe();
+
+          subscription = channel;
+          console.log("Admin page: Setup complete");
+        }
+      } catch (error: any) {
+        console.error("Admin page: Error checking auth:", error);
+        if (mounted) {
+          try {
+            await router.push("/queue");
+          } catch (err) {
+            console.error("Admin page: Navigation error in catch", err);
+            window.location.href = "/queue";
+          }
+        }
+      }
+    };
+
+    setupAuthListener();
 
     return () => {
+      console.log("Admin page: Cleanup called");
+      mounted = false;
       if (pollIntervalRef.current) clearInterval(pollIntervalRef.current);
-      supabase.removeChannel(channel);
+      if (subscription) supabase.removeChannel(subscription);
     };
-  }, []);
+  }, [router]);
 
   const startSession = async () => {
     if (!sessionTitle.trim()) {
@@ -1765,7 +1852,7 @@ function QueueCard({
           }}
           className="w-full py-3 bg-green-500/10 text-green-500 border border-green-500/20 rounded-2xl text-[9px] font-black uppercase tracking-[0.2em] hover:bg-green-500 hover:text-white transition-all"
         >
-          Resend WhatsApp
+          Resend WhatsApp 
         </button>
       )}
 
