@@ -268,7 +268,7 @@ export default function QueuePage() {
               <div className="relative w-12 h-12 sm:w-14 sm:h-14">
                 <div className="absolute inset-0 rounded-2xl bg-white/15 blur-md" />
                 <Image
-                  src="/logo.png"
+                  src="/Logo.png"
                   alt="Sayunk.Photobooth"
                   fill
                   sizes="44px"

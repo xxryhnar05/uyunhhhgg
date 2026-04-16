@@ -573,7 +573,7 @@ export default function AdminPage() {
                 <div className="relative p-1.5 bg-white/5 border border-white/10 rounded-2xl shadow-lg">
                   <div className="relative w-11 h-11 overflow-hidden">
                     <Image
-                      src="/logo.png"
+                      src="/Logo.png"
                       alt="Sayunk.Photobooth"
                       fill
                       sizes="44px"
