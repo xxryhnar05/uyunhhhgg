@@ -29,32 +29,54 @@ export default function QueuePage() {
     null,
   );
   const [checkingSession, setCheckingSession] = useState(false);
+  const [sessionError, setSessionError] = useState<string | null>(null);
+  const [lastFetchTime, setLastFetchTime] = useState<string | null>(null);
+  const [fetchAttempts, setFetchAttempts] = useState(0);
 
   const pollRef = useRef<NodeJS.Timeout | null>(null);
 
   const fetchActiveSession = async (silent = false) => {
-    if (!silent) setCheckingSession(true);
+    if (!silent) {
+      setCheckingSession(true);
+      setFetchAttempts((prev) => prev + 1);
+    }
 
-    const { data, error } = await supabase
-      .from("queue_sessions")
-      .select("id, title, status, started_at")
-      .eq("status", "active")
-      .order("started_at", { ascending: false })
-      .limit(1)
-      .maybeSingle();
+    try {
+      const startTime = new Date().toLocaleTimeString('id-ID');
+      const { data, error } = await supabase
+        .from("queue_sessions")
+        .select("id, title, status, started_at")
+        .eq("status", "active")
+        .order("started_at", { ascending: false })
+        .limit(1)
+        .maybeSingle();
 
-    if (error) {
-      console.error("fetchActiveSession error:", error.message);
+      if (error) {
+        console.error("fetchActiveSession error:", error.message);
+        const errorMsg = `❌ Error fetching session: ${error.message}`;
+        setSessionError(errorMsg);
+        setActiveSession(null);
+        setLastFetchTime(startTime);
+        if (!silent) setCheckingSession(false);
+        return null;
+      }
+
+      const session = (data as ActiveSession | null) || null;
+      setActiveSession(session);
+      setSessionError(null); // Clear error on success
+      setLastFetchTime(startTime);
+
+      if (!silent) setCheckingSession(false);
+      return session;
+    } catch (err: any) {
+      console.error("fetchActiveSession exception:", err);
+      const errorMsg = `❌ Error fetching session: ${err?.message || "Unknown error"}`;
+      setSessionError(errorMsg);
       setActiveSession(null);
+      setLastFetchTime(new Date().toLocaleTimeString('id-ID'));
       if (!silent) setCheckingSession(false);
       return null;
     }
-
-    const session = (data as ActiveSession | null) || null;
-    setActiveSession(session);
-
-    if (!silent) setCheckingSession(false);
-    return session;
   };
 
   useEffect(() => {
@@ -222,7 +244,7 @@ export default function QueuePage() {
     }
   };
 
-  const isSubmitDisabled = isAdminLogin ? loading : loading || checkingSession;
+  const isSubmitDisabled = isAdminLogin ? loading : loading || checkingSession || !!sessionError;
 
   return (
     <div className="min-h-screen bg-[#050505] text-slate-200 font-sans overflow-x-hidden selection:bg-purple-500/30">
@@ -313,38 +335,122 @@ export default function QueuePage() {
 
               <div className="mt-8 max-w-xl">
                 {checkingSession ? (
-                  <div className="rounded-4xl border border-white/10 bg-white/3 p-5">
-                    <p className="text-[10px] font-black uppercase tracking-[0.24em] text-slate-500 mb-2">
-                      Session Status
-                    </p>
-                    <p className="text-base font-black text-white">
-                      Mengecek sesi aktif...
-                    </p>
+                  <div className="rounded-4xl border border-blue-500/20 bg-blue-500/8 p-6 animate-in fade-in duration-300">
+                    <div className="flex items-start gap-4">
+                      <div className="flex-shrink-0 mt-1">
+                        <div className="flex h-8 w-8 items-center justify-center rounded-full bg-blue-500/20 border border-blue-500/30">
+                          <div className="animate-spin">
+                            <svg className="w-4 h-4 text-blue-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M13 10V3L4 14h7v7l9-11h-7z" />
+                            </svg>
+                          </div>
+                        </div>
+                      </div>
+                      <div className="flex-1">
+                        <p className="text-[10px] font-black uppercase tracking-[0.24em] text-blue-400 mb-1">
+                          ⟳ Checking Session
+                        </p>
+                        <p className="text-base font-black text-white mb-2">
+                          Sedang mengecek sesi aktif...
+                        </p>
+                        <div className="text-[11px] text-slate-400 space-y-1">
+                          <p>Attempt #{fetchAttempts}</p>
+                          {lastFetchTime && <p>Last check: {lastFetchTime}</p>}
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                ) : sessionError ? (
+                  <div className="rounded-4xl border border-orange-500/20 bg-orange-500/8 p-6 animate-in fade-in duration-300">
+                    <div className="flex items-start gap-4 mb-4">
+                      <div className="flex-shrink-0 pt-0.5">
+                        <div className="flex h-8 w-8 items-center justify-center rounded-full bg-orange-500/20 border border-orange-500/30">
+                          <svg className="w-4 h-4 text-orange-400" fill="currentColor" viewBox="0 0 20 20">
+                            <path fillRule="evenodd" d="M8.257 3.099c.765-1.36 2.722-1.36 3.486 0l5.58 9.92c.75 1.334-.213 2.98-1.742 2.98H4.42c-1.53 0-2.493-1.646-1.743-2.98l5.58-9.92zM11 13a1 1 0 11-2 0 1 1 0 012 0zm-1-8a1 1 0 00-1 1v3a1 1 0 002 0V6a1 1 0 00-1-1z" clipRule="evenodd" />
+                          </svg>
+                        </div>
+                      </div>
+                      <div className="flex-1">
+                        <p className="text-[10px] font-black uppercase tracking-[0.24em] text-orange-400 mb-1">
+                          ⚠️ Connection Error
+                        </p>
+                        <p className="text-base font-black text-white mb-3">
+                          {sessionError}
+                        </p>
+                        <div className="text-[11px] text-slate-400 space-y-2 mb-4">
+                          <p>Attempts: #{fetchAttempts}</p>
+                          <p>Last error: {lastFetchTime}</p>
+                          <p className="text-orange-300/70">⟳ Auto-retrying every 3 seconds...</p>
+                        </div>
+                        <button
+                          type="button"
+                          onClick={() => fetchActiveSession(false)}
+                          className="text-[10px] font-black uppercase tracking-[0.22em] px-4 py-2 rounded-lg border border-orange-500/30 bg-orange-500/10 text-orange-300 hover:bg-orange-500/20 transition-colors"
+                        >
+                          🔄 Retry Now
+                        </button>
+                      </div>
+                    </div>
                   </div>
                 ) : activeSession ? (
-                  <div className="rounded-4xl border border-green-500/20 bg-green-500/8 p-5">
-                    <p className="text-[10px] font-black uppercase tracking-[0.24em] text-green-400 mb-2">
-                      Sesi Aktif
-                    </p>
-                    <p className="text-xl font-black text-white tracking-tight">
-                      {activeSession.title}
-                    </p>
-                    <p className="mt-2 text-xs text-slate-400 leading-relaxed">
-                      Nomor antrian akan dimulai dari 1 untuk sesi ini.
-                    </p>
+                  <div className="rounded-4xl border border-green-500/20 bg-green-500/8 p-6 animate-in fade-in duration-300">
+                    <div className="flex items-start gap-4">
+                      <div className="flex-shrink-0 pt-0.5">
+                        <div className="flex h-8 w-8 items-center justify-center rounded-full bg-green-500/20 border border-green-500/30">
+                          <svg className="w-4 h-4 text-green-400" fill="currentColor" viewBox="0 0 20 20">
+                            <path fillRule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zm3.707-9.293a1 1 0 00-1.414-1.414L9 10.586 7.707 9.293a1 1 0 00-1.414 1.414l2 2a1 1 0 001.414 0l4-4z" clipRule="evenodd" />
+                          </svg>
+                        </div>
+                      </div>
+                      <div className="flex-1">
+                        <p className="text-[10px] font-black uppercase tracking-[0.24em] text-green-400 mb-1">
+                          ✓ Sesi Aktif
+                        </p>
+                        <p className="text-xl font-black text-white tracking-tight mb-3">
+                          {activeSession.title}
+                        </p>
+                        <div className="text-[11px] text-slate-400 space-y-1 mb-2">
+                          <p>Status: {activeSession.status}</p>
+                          <p>Started: {new Date(activeSession.started_at).toLocaleString('id-ID')}</p>
+                          <p>Session ID: {activeSession.id.substring(0, 8)}...</p>
+                        </div>
+                        <p className="text-[10px] text-green-300/70">
+                          Nomor antrian akan dimulai dari 1 untuk sesi ini.
+                        </p>
+                      </div>
+                    </div>
                   </div>
                 ) : (
-                  <div className="rounded-4xl border border-red-500/20 bg-red-500/8 p-5">
-                    <p className="text-[10px] font-black uppercase tracking-[0.24em] text-red-400 mb-2">
-                      Session Status
-                    </p>
-                    <p className="text-base font-black text-white">
-                      Belum ada sesi aktif
-                    </p>
-                    <p className="mt-2 text-xs text-slate-400 leading-relaxed">
-                      Tunggu admin memulai sesi. Halaman ini akan update
-                      otomatis.
-                    </p>
+                  <div className="rounded-4xl border border-red-500/20 bg-red-500/8 p-6 animate-in fade-in duration-300">
+                    <div className="flex items-start gap-4">
+                      <div className="flex-shrink-0 pt-0.5">
+                        <div className="flex h-8 w-8 items-center justify-center rounded-full bg-red-500/20 border border-red-500/30">
+                          <svg className="w-4 h-4 text-red-400" fill="currentColor" viewBox="0 0 20 20">
+                            <path fillRule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zM8.707 7.293a1 1 0 00-1.414 1.414L8.586 10l-1.293 1.293a1 1 0 101.414 1.414L10 11.414l1.293 1.293a1 1 0 001.414-1.414L11.414 10l1.293-1.293a1 1 0 00-1.414-1.414L10 8.586 8.707 7.293z" clipRule="evenodd" />
+                          </svg>
+                        </div>
+                      </div>
+                      <div className="flex-1">
+                        <p className="text-[10px] font-black uppercase tracking-[0.24em] text-red-400 mb-1">
+                          No Active Session
+                        </p>
+                        <p className="text-base font-black text-white mb-3">
+                          Belum ada sesi aktif
+                        </p>
+                        <div className="text-[11px] text-slate-400 space-y-2 mb-2">
+                          <p>Status: Waiting for admin to start session</p>
+                          {lastFetchTime && <p>Last check: {lastFetchTime}</p>}
+                          <p className="text-slate-300/70">⟳ Auto-checking every 3 seconds...</p>
+                        </div>
+                        <button
+                          type="button"
+                          onClick={() => fetchActiveSession(false)}
+                          className="text-[10px] font-black uppercase tracking-[0.22em] px-4 py-2 rounded-lg border border-red-500/30 bg-red-500/10 text-red-300 hover:bg-red-500/20 transition-colors"
+                        >
+                          🔄 Check Now
+                        </button>
+                      </div>
+                    </div>
                   </div>
                 )}
               </div>
@@ -455,11 +561,13 @@ export default function QueuePage() {
                     <p className="mt-4 text-slate-500 text-base font-medium leading-relaxed">
                       {isAdminLogin
                         ? "Masuk untuk mengelola daftar antrian dan status pelanggan."
-                        : activeSession
-                          ? "Isi data singkat Anda lalu dapatkan tiket antrian secara instan."
-                          : checkingSession
-                            ? "Sedang mengecek sesi aktif."
-                            : "Saat ini belum ada sesi aktif. Silakan tunggu admin membuka sesi."}
+                        : sessionError
+                          ? `Koneksi error terjadi saat fetch session. Sistem sedang mencoba menyambung kembali secara otomatis (Attempt #${fetchAttempts}). Anda juga bisa klik tombol Retry untuk cek manual.`
+                          : activeSession
+                            ? `✓ Sesi "${activeSession.title}" sudah aktif! Isi data Anda untuk mendapatkan tiket antrian.`
+                            : checkingSession
+                              ? "Sedang mengecek ketersediaan sesi aktif dari admin..."
+                              : "Belum ada sesi aktif. Admin perlu membuka sesi terlebih dahulu. Halaman ini akan update otomatis setiap 3 detik."}
                     </p>
                   </div>
 
@@ -525,12 +633,16 @@ export default function QueuePage() {
                       }`}
                     >
                       {loading
-                        ? "Processing..."
+                        ? "⟳ Processing..."
                         : isAdminLogin
                           ? "Authenticate"
-                          : checkingSession
-                            ? "Checking Session..."
-                            : "Get My Ticket"}
+                          : sessionError
+                            ? "⚠️ Error - Waiting..."
+                            : checkingSession
+                              ? "⟳ Checking Session..."
+                              : !activeSession
+                                ? "⏳ No Session Yet"
+                                : "Get My Ticket"}
                     </button>
                   </form>
 
