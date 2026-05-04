@@ -5,6 +5,7 @@ import { useRouter } from "next/navigation";
 import Image from "next/image";
 import { supabase } from "@/lib/supabase";
 
+// --- Interfaces ---
 interface ActiveSession {
   id: string;
   title: string;
@@ -14,27 +15,30 @@ interface ActiveSession {
 
 export default function QueuePage() {
   const router = useRouter();
-
+  
+  // UI State
+  const [currentStep, setCurrentStep] = useState<"home" | "queue">("home");
+  const [hasMounted, setHasMounted] = useState(false);
+  
+  // Logic State
   const [name, setName] = useState("");
   const [phone, setPhone] = useState("");
   const [queueNumber, setQueueNumber] = useState<number | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
-
   const [isAdminLogin, setIsAdminLogin] = useState(false);
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
-
-  const [activeSession, setActiveSession] = useState<ActiveSession | null>(
-    null,
-  );
+  const [activeSession, setActiveSession] = useState<ActiveSession | null>(null);
   const [checkingSession, setCheckingSession] = useState(false);
-
   const pollRef = useRef<NodeJS.Timeout | null>(null);
+
+  useEffect(() => {
+    setHasMounted(true);
+  }, []);
 
   const fetchActiveSession = async (silent = false) => {
     if (!silent) setCheckingSession(true);
-
     const { data, error } = await supabase
       .from("queue_sessions")
       .select("id, title, status, started_at")
@@ -44,62 +48,40 @@ export default function QueuePage() {
       .maybeSingle();
 
     if (error) {
-      console.error("fetchActiveSession error:", error.message);
       setActiveSession(null);
       if (!silent) setCheckingSession(false);
       return null;
     }
-
     const session = (data as ActiveSession | null) || null;
     setActiveSession(session);
-
     if (!silent) setCheckingSession(false);
     return session;
   };
 
   useEffect(() => {
-    let visibilityHandler: (() => void) | null = null;
-
-    setCheckingSession(true);
     fetchActiveSession();
+    let subscription: any = null;
 
-    const channel = supabase
-      .channel("queue-page-session-listener")
-      .on(
-        "postgres_changes",
-        { event: "*", schema: "public", table: "queue_sessions" },
-        () => {
-          fetchActiveSession(true);
-        },
-      )
-      .subscribe((status) => {
-        console.log("Realtime status:", status);
-      });
-
-    pollRef.current = setInterval(() => {
-      fetchActiveSession(true);
-    }, 3000);
-
-    const onFocus = () => {
-      fetchActiveSession(true);
-    };
-
-    visibilityHandler = () => {
-      if (document.visibilityState === "visible") {
-        fetchActiveSession(true);
+    const setupRealtimeListener = () => {
+      try {
+        subscription = supabase
+          .channel("queue-page-session-listener")
+          .on("postgres_changes", { event: "*", schema: "public", table: "queue_sessions" }, () => {
+            fetchActiveSession(true);
+          })
+          .subscribe();
+      } catch (err) {
+        console.error("Real-time setup failed:", err);
       }
     };
 
-    window.addEventListener("focus", onFocus);
-    document.addEventListener("visibilitychange", visibilityHandler);
+    setupRealtimeListener();
+    const pollInterval = setInterval(() => fetchActiveSession(true), 1000);
+    pollRef.current = pollInterval;
 
     return () => {
       if (pollRef.current) clearInterval(pollRef.current);
-      window.removeEventListener("focus", onFocus);
-      if (visibilityHandler) {
-        document.removeEventListener("visibilitychange", visibilityHandler);
-      }
-      supabase.removeChannel(channel);
+      if (subscription) supabase.removeChannel(subscription);
     };
   }, []);
 
@@ -107,45 +89,12 @@ export default function QueuePage() {
     e.preventDefault();
     setLoading(true);
     setError("");
-
     try {
-      console.log("Starting admin login with email:", email);
-
-      const { data, error: loginError } =
-        await supabase.auth.signInWithPassword({
-          email,
-          password,
-        });
-
-      if (loginError) {
-        console.error("Login error:", loginError);
-        setError(
-          "Login gagal! Periksa email dan password. Error: " +
-            loginError.message,
-        );
-        setLoading(false);
-        return;
-      }
-
-      console.log("Login successful, user:", data.user?.email);
-
-      // Clear email and password after successful login
-      setEmail("");
-      setPassword("");
-      setLoading(false);
-
-      console.log("Navigating to admin page...");
-      // Navigate to admin page with better error handling
-      try {
-        await router.push("/admin");
-        console.log("Navigation successful");
-      } catch (navError) {
-        console.error("Navigation error, trying replace:", navError);
-        await router.replace("/admin");
-      }
+      const { error: loginError } = await supabase.auth.signInWithPassword({ email, password });
+      if (loginError) throw loginError;
+      router.push("/admin");
     } catch (err: any) {
-      console.error("Login exception:", err);
-      setError("Terjadi kesalahan: " + (err.message || "Unknown error"));
+      setError("Login gagal! Periksa email dan password.");
       setLoading(false);
     }
   };
@@ -153,521 +102,292 @@ export default function QueuePage() {
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setError("");
-
     if (!name.trim() || !phone.trim()) {
-      setError("Nama dan nomor HP harus diisi");
+      setError("Nama dan nomor HP wajib diisi.");
       return;
     }
-
     setLoading(true);
-
     try {
       const latestSession = await fetchActiveSession(true);
-
-      if (!latestSession) {
-        throw new Error(
-          "Sesi belum dimulai. Silakan tunggu admin membuka sesi.",
-        );
-      }
+      if (!latestSession) throw new Error("Maaf, sesi baru saja ditutup.");
 
       const { data: user, error: userError } = await supabase
         .from("users")
-        .insert([
-          {
-            name: name.trim(),
-            phone: phone.trim(),
-          },
-        ])
-        .select()
-        .single();
-
+        .insert([{ name: name.trim(), phone: phone.trim() }])
+        .select().single();
       if (userError) throw userError;
 
-      const { data: lastQueue, error: lastQueueError } = await supabase
+      const { data: lastQueue } = await supabase
         .from("queues")
         .select("queue_number")
         .eq("session_id", latestSession.id)
         .order("queue_number", { ascending: false })
-        .limit(1)
-        .maybeSingle();
-
-      if (lastQueueError) throw lastQueueError;
-
+        .limit(1).maybeSingle();
+      
       const nextQueueNumber = lastQueue ? lastQueue.queue_number + 1 : 1;
 
       const { data: queue, error: queueError } = await supabase
         .from("queues")
-        .insert([
-          {
-            user_id: user.id,
-            session_id: latestSession.id,
-            queue_number: nextQueueNumber,
-            status: "pending_confirmation",
-            price: 0,
-          },
-        ])
-        .select()
-        .single();
-
+        .insert([{
+          user_id: user.id,
+          session_id: latestSession.id,
+          queue_number: nextQueueNumber,
+          status: "pending_confirmation",
+          price: 0,
+        }])
+        .select().single();
       if (queueError) throw queueError;
 
       setQueueNumber(queue.queue_number);
-
-      setTimeout(() => {
-        router.push(`/queue/${queue.id}`);
-      }, 2500);
+      setTimeout(() => router.push(`/queue/${queue.id}`), 2500);
     } catch (err: any) {
-      setError(err.message || "Terjadi kesalahan.");
+      setError(err.message);
       setLoading(false);
     }
   };
 
-  const isSubmitDisabled = isAdminLogin ? loading : loading || checkingSession;
+  if (!hasMounted) return <div className="min-h-screen bg-[#050505]" />;
 
   return (
-    <div className="min-h-screen bg-[#050505] text-slate-200 font-sans overflow-x-hidden selection:bg-purple-500/30">
-      <div className="relative min-h-screen flex flex-col lg:flex-row">
-        <div className="absolute inset-0 pointer-events-none opacity-[0.03]">
-          <div
-            className="w-full h-full"
-            style={{
-              backgroundImage: "radial-gradient(#ffffff 1px, transparent 1px)",
-              backgroundSize: "28px 28px",
-            }}
-          />
-        </div>
-
-        <div className="absolute -top-24 -left-24 w-80 h-80 bg-purple-600/10 rounded-full blur-[120px] pointer-events-none" />
-        <div className="absolute bottom-0 right-0 w-80 h-80 bg-blue-600/10 rounded-full blur-[120px] pointer-events-none" />
-
-        <section className="relative w-full lg:w-[52%] px-6 sm:px-10 lg:px-16 py-10 lg:py-14 border-b lg:border-b-0 lg:border-r border-white/5 flex flex-col justify-between">
-          <div className="flex items-center justify-between gap-4">
-            <div className="flex items-center gap-4">
-              <div className="relative w-12 h-12 sm:w-14 sm:h-14">
-                <div className="absolute inset-0 rounded-2xl bg-white/15 blur-md" />
-                <Image
-                  src="/logo.png"
-                  alt="Sayunk.Photobooth"
-                  fill
-                  sizes="44px"
-                  className="object-contain"
-                  priority
-                />
-              </div>
-
-              <div>
-                <p className="text-white text-lg sm:text-xl font-black tracking-tighter uppercase italic">
-                  Sayunk<span className="text-purple-500">.</span>Photobooth
-                </p>
-                <p className="text-[10px] sm:text-[11px] text-slate-500 font-bold uppercase tracking-[0.28em] mt-1">
-                  Digital Photo Experience
-                </p>
-              </div>
-            </div>
-
-            <button
-              type="button"
-              onClick={() => {
-                setIsAdminLogin(!isAdminLogin);
-                setError("");
-                setLoading(false);
-              }}
-              className="relative z-30 pointer-events-auto inline-flex items-center gap-2 rounded-2xl border border-white/10 bg-white/5 px-4 py-3 text-[10px] font-black uppercase tracking-[0.24em] text-slate-400 hover:text-white hover:bg-white/10 transition-all active:scale-95"
-            >
-              <svg
-                className="w-4 h-4"
-                fill="none"
-                stroke="currentColor"
-                viewBox="0 0 24 24"
-              >
-                <path
-                  strokeLinecap="round"
-                  strokeLinejoin="round"
-                  strokeWidth="2.2"
-                  d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z"
-                />
-              </svg>
-              {isAdminLogin ? "User Mode" : "Admin"}
-            </button>
-          </div>
-
-          <div className="py-20 lg:py-20">
-            <div className="max-w-2xl">
-              <h1 className="text-5xl sm:text-6xl lg:text-7xl xl:text-8xl font-black leading-[0.88] tracking-tighter lowercase text-white">
-                capture <br />
-                <span className="text-transparent bg-clip-text bg-linear-to-r from-purple-400 via-fuchsia-400 to-blue-400">
-                  moments
-                </span>{" "}
-                <br />
-                instantly.
-              </h1>
-
-              <p className="mt-8 max-w-xl text-base sm:text-lg lg:text text-slate-400 font-medium leading-relaxed">
-                Studio photobooth digital masa kini.
-                <span className="text-white">
-                  {" "}
-                  Ambil nomor antrian secara instan
-                </span>{" "}
-                dan nikmati pengalaman yang cepat, rapi, dan modern.
-              </p>
-
-              <div className="mt-8 max-w-xl">
-                {checkingSession ? (
-                  <div className="rounded-4xl border border-white/10 bg-white/3 p-5">
-                    <p className="text-[10px] font-black uppercase tracking-[0.24em] text-slate-500 mb-2">
-                      Session Status
-                    </p>
-                    <p className="text-base font-black text-white">
-                      Mengecek sesi aktif...
-                    </p>
-                  </div>
-                ) : activeSession ? (
-                  <div className="rounded-4xl border border-green-500/20 bg-green-500/8 p-5">
-                    <p className="text-[10px] font-black uppercase tracking-[0.24em] text-green-400 mb-2">
-                      Sesi Aktif
-                    </p>
-                    <p className="text-xl font-black text-white tracking-tight">
-                      {activeSession.title}
-                    </p>
-                    <p className="mt-2 text-xs text-slate-400 leading-relaxed">
-                      Nomor antrian akan dimulai dari 1 untuk sesi ini.
-                    </p>
-                  </div>
-                ) : (
-                  <div className="rounded-4xl border border-red-500/20 bg-red-500/8 p-5">
-                    <p className="text-[10px] font-black uppercase tracking-[0.24em] text-red-400 mb-2">
-                      Session Status
-                    </p>
-                    <p className="text-base font-black text-white">
-                      Belum ada sesi aktif
-                    </p>
-                    <p className="mt-2 text-xs text-slate-400 leading-relaxed">
-                      Tunggu admin memulai sesi. Halaman ini akan update
-                      otomatis.
-                    </p>
-                  </div>
-                )}
-              </div>
-
-              <div className="mt-10 grid grid-cols-1 sm:grid-cols-3 gap-4 max-w-2xl">
-                <InfoPill
-                  title="Cepat"
-                  desc="Ambil tiket dalam hitungan detik"
-                />
-                <InfoPill
-                  title="Otomatis"
-                  desc="Nomor antrian update real-time"
-                />
-                <InfoPill title="Praktis" desc="Tanpa ribet antri manual" />
-              </div>
-            </div>
-          </div>
-
-          <div className="pt-8 border-t border-white/5 flex items-center justify-between gap-4">
-            <p className="text-[10px] font-bold uppercase tracking-[0.28em] text-slate-600">
-              Built for Sayunk Studio
-            </p>
-            <p className="text-[10px] font-black uppercase tracking-[0.24em] text-slate-500">
-              2026
-            </p>
-          </div>
-        </section>
-
-        <section className="relative w-full lg:w-[48%] flex items-center justify-center px-6 sm:px-10 lg:px-16 py-10 lg:py-14 bg-[#09090B]">
-          <div className="w-full max-w-md relative z-10">
-            {queueNumber ? (
-              <div className="relative animate-in zoom-in-95 duration-700">
-                <div className="absolute -inset-1 rounded-4xl bg-linear-to-br from-purple-500/30 via-fuchsia-500/10 to-blue-500/30 blur-xl opacity-70" />
-                <div className="relative rounded-4xl border border-white/10 bg-[#0E0E11]/95 backdrop-blur-xl overflow-hidden shadow-[0_24px_80px_rgba(0,0,0,0.45)]">
-                  <div className="p-10 text-center">
-                    <div className="w-20 h-20 mx-auto bg-green-500/10 rounded-full flex items-center justify-center ring-1 ring-green-500/20 mb-6">
-                      <svg
-                        className="w-10 h-10 text-green-400"
-                        fill="none"
-                        stroke="currentColor"
-                        viewBox="0 0 24 24"
-                      >
-                        <path
-                          strokeLinecap="round"
-                          strokeLinejoin="round"
-                          strokeWidth={2.5}
-                          d="M5 13l4 4L19 7"
-                        />
-                      </svg>
-                    </div>
-
-                    <p className="text-[10px] font-black uppercase tracking-[0.3em] text-green-400 mb-3">
-                      Ticket Created
-                    </p>
-                    <h2 className="text-3xl font-black text-white italic tracking-tighter">
-                      Antrian Berhasil
-                    </h2>
-                    <p className="text-slate-500 text-sm mt-3 leading-relaxed">
-                      Tiket digital Anda sedang disiapkan. Mohon tunggu
-                      sebentar.
-                    </p>
-
-                    {activeSession && (
-                      <div className="mt-5 rounded-2xl border border-white/8 bg-white/3 px-4 py-3">
-                        <p className="text-[10px] font-black uppercase tracking-[0.24em] text-slate-500 mb-1">
-                          Session
-                        </p>
-                        <p className="text-sm font-black text-white">
-                          {activeSession.title}
-                        </p>
-                      </div>
-                    )}
-
-                    <div className="mt-8 rounded-4xl border border-white/10 bg-linear-to-b from-white/5 to-transparent p-8 relative overflow-hidden">
-                      <div className="absolute inset-x-0 top-0 h-1 bg-linear-to-r from-purple-500 via-fuchsia-500 to-blue-500 opacity-70" />
-                      <p className="text-[10px] font-black uppercase tracking-[0.3em] text-slate-500">
-                        Queue Number
-                      </p>
-                      <div className="mt-4 text-8xl sm:text-9xl font-black italic leading-none tracking-tighter text-white drop-shadow-[0_10px_25px_rgba(255,255,255,0.08)]">
-                        #{queueNumber}
-                      </div>
-                    </div>
-
-                    <p className="mt-6 text-[11px] text-slate-500 font-bold uppercase tracking-[0.22em]">
-                      Anda akan diarahkan ke halaman tiket
-                    </p>
-                  </div>
-
-                  <div className="h-1.5 w-full bg-linear-to-r from-purple-600 via-fuchsia-500 to-blue-600" />
-                </div>
-              </div>
-            ) : (
-              <div className="relative animate-in fade-in slide-in-from-bottom-6 duration-700">
-                <div className="absolute -inset-1 rounded-4xl bg-linear-to-br from-purple-500/25 to-blue-500/25 blur-xl opacity-60" />
-                <div className="relative rounded-4xl border border-white/10 bg-[#0D0D10]/95 backdrop-blur-xl shadow-[0_24px_80px_rgba(0,0,0,0.42)] p-8 sm:p-10">
-                  <div className="mb-8">
-                    <div className="inline-flex items-center gap-2 px-3 py-1.5 rounded-full bg-white/5 border border-white/10 mb-5">
-                      <span className="w-2 h-2 rounded-full bg-purple-400" />
-                      <span className="text-[10px] font-black uppercase tracking-[0.24em] text-slate-400">
-                        {isAdminLogin ? "Admin Access" : "Guest Ticket"}
-                      </span>
-                    </div>
-
-                    <h2 className="text-4xl sm:text-5xl font-black tracking-tighter uppercase italic leading-none text-white whitespace-pre-line">
-                      {isAdminLogin ? "Admin\nLogin." : "Ambil Tiket."}
-                    </h2>
-
-                    <p className="mt-4 text-slate-500 text-base font-medium leading-relaxed">
-                      {isAdminLogin
-                        ? "Masuk untuk mengelola daftar antrian dan status pelanggan."
-                        : activeSession
-                          ? "Isi data singkat Anda lalu dapatkan tiket antrian secara instan."
-                          : checkingSession
-                            ? "Sedang mengecek sesi aktif."
-                            : "Saat ini belum ada sesi aktif. Silakan tunggu admin membuka sesi."}
-                    </p>
-                  </div>
-
-                  <form
-                    onSubmit={isAdminLogin ? handleAdminLogin : handleSubmit}
-                    className="space-y-6"
-                  >
-                    <div className="space-y-4">
-                      {isAdminLogin ? (
-                        <>
-                          <InputField
-                            label="Admin Email"
-                            type="email"
-                            placeholder="admin@sayunk.com"
-                            value={email}
-                            onChange={setEmail}
-                          />
-                          <InputField
-                            label="Password"
-                            type="password"
-                            placeholder="••••••••"
-                            value={password}
-                            onChange={setPassword}
-                          />
-                        </>
-                      ) : (
-                        <>
-                          <InputField
-                            label="Full Name"
-                            type="text"
-                            placeholder="Masukkan nama anda"
-                            value={name}
-                            onChange={setName}
-                          />
-                          <InputField
-                            label="WhatsApp Number"
-                            type="tel"
-                            placeholder="Masukkan nomor WhatsApp anda"
-                            value={phone}
-                            onChange={setPhone}
-                          />
-                        </>
-                      )}
-                    </div>
-
-                    {error && (
-                      <div className="flex items-start gap-3 rounded-2xl border border-red-500/15 bg-red-500/5 p-4 text-red-300">
-                        <span className="text-base leading-none mt-0.5">⚠</span>
-                        <p className="text-xs font-bold leading-relaxed">
-                          {error}
-                        </p>
-                      </div>
-                    )}
-
-                    <button
-                      type="submit"
-                      disabled={isSubmitDisabled}
-                      suppressHydrationWarning
-                      className={`w-full rounded-2xl py-5 font-black uppercase tracking-[0.22em] transition-all duration-300 shadow-2xl active:scale-[0.98] disabled:opacity-50 disabled:cursor-not-allowed ${
-                        isAdminLogin
-                          ? "bg-white text-black hover:bg-slate-200 shadow-white/5"
-                          : "bg-linear-to-r from-purple-600 via-fuchsia-500 to-blue-600 text-white hover:brightness-110 shadow-purple-600/30"
-                      }`}
-                    >
-                      {loading
-                        ? "Processing..."
-                        : isAdminLogin
-                          ? "Authenticate"
-                          : checkingSession
-                            ? "Checking Session..."
-                            : "Get My Ticket"}
-                    </button>
-                  </form>
-
-                  {!isAdminLogin && (
-                    <div className="mt-8 pt-8 border-t border-white/5">
-                      <p className="text-[10px] font-bold uppercase tracking-[0.26em] text-slate-600 text-center mb-5">
-                        Connect With Us
-                      </p>
-                      <div className="flex items-center justify-center gap-4">
-                        <SocialLink
-                          href="https://instagram.com/sayunk_photobooth"
-                          icon={<InstagramIcon />}
-                        />
-                        <SocialLink
-                          href="https://wa.me/087893710446"
-                          icon={<WhatsAppIcon />}
-                        />
-                        <SocialLink
-                          href="https://tiktok.com/@sayunk_photobooth"
-                          icon={<TikTokIcon />}
-                        />
-                      </div>
-                    </div>
-                  )}
-                </div>
-              </div>
-            )}
-          </div>
-        </section>
+    <div className="min-h-screen bg-[#050505] text-white font-sans selection:bg-purple-500/30 overflow-x-hidden">
+      {/* Background Glow */}
+      <div className="fixed inset-0 z-0 pointer-events-none">
+        <div className="absolute top-[-10%] left-[-10%] w-[50%] h-[50%] bg-purple-600/10 rounded-full blur-[120px]" />
+        <div className="absolute bottom-[-10%] right-[-10%] w-[50%] h-[50%] bg-blue-600/10 rounded-full blur-[120px]" />
       </div>
 
-      <footer className="border-t border-white/5 bg-black/70 px-6 py-6">
-        <div className="mx-auto max-w-7xl flex flex-col md:flex-row items-center justify-between gap-3">
-          <p className="text-[10px] font-bold uppercase tracking-[0.22em] text-slate-600">
-            Built with precision for{" "}
-            <span className="text-slate-300 italic">Sayunk Studio</span>
+      <main className="relative z-10 container mx-auto px-6 py-6 min-h-screen flex flex-col">
+        {/* Navbar */}
+        <nav className="flex justify-between items-center mb-10 md:mb-16">
+          <div className="flex items-center gap-3">
+            <div className="w-10 h-10 relative">
+              <Image src="/logo.png" alt="Logo" fill className="object-contain" priority />
+            </div>
+            <div className="hidden sm:block">
+              <span className="font-black tracking-tighter text-xl uppercase italic block leading-none">
+                Sayunk<span className="text-purple-500">.</span>
+              </span>
+              <span className="text-[8px] uppercase tracking-[0.3em] text-slate-500 font-bold">Photobooth</span>
+            </div>
+          </div>
+          <button 
+            onClick={() => {
+              setIsAdminLogin(!isAdminLogin);
+              setError("");
+            }}
+            className="text-[10px] font-black tracking-[0.2em] uppercase px-5 py-2.5 rounded-xl border border-white/10 bg-white/5 hover:bg-white/10 hover:border-white/20 transition-all active:scale-95"
+          >
+            {isAdminLogin ? "Mode User" : "Admin Login"}
+          </button>
+        </nav>
+
+        <div className="flex-1 flex flex-col justify-center max-w-6xl mx-auto w-full">
+          {currentStep === "home" ? (
+            <HomePage 
+              activeSession={activeSession} 
+              checkingSession={checkingSession} 
+              onStart={() => setCurrentStep("queue")} 
+            />
+          ) : (
+            <QueueFormPage 
+              isAdminLogin={isAdminLogin}
+              loading={loading}
+              error={error}
+              name={name}
+              setName={setName}
+              phone={phone}
+              setPhone={setPhone}
+              email={email}
+              setEmail={setEmail}
+              password={password}
+              setPassword={setPassword}
+              handleSubmit={isAdminLogin ? handleAdminLogin : handleSubmit}
+              queueNumber={queueNumber}
+              onBack={() => {
+                setCurrentStep("home");
+                setIsAdminLogin(false);
+                setError("");
+              }}
+              activeSession={activeSession}
+            />
+          )}
+        </div>
+
+        <footer className="mt-12 pt-8 border-t border-white/5 text-center">
+          <p className="text-[9px] text-slate-600 font-bold uppercase tracking-[0.4em]">
+            Digital Queue System • Sayunk Studio 2026
           </p>
-          <p className="text-[10px] font-black uppercase tracking-[0.22em] text-slate-500">
-            Copyright © 2026 <span className="text-purple-400">ryhnar25</span>.
-            All rights reserved.
+        </footer>
+      </main>
+    </div>
+  );
+}
+
+// --- HOME PAGE COMPONENT ---
+function HomePage({ activeSession, checkingSession, onStart }: any) {
+  return (
+    <div className="grid lg:grid-cols-2 gap-12 items-center animate-in fade-in slide-in-from-bottom-10 duration-1000">
+      <div className="text-center lg:text-left">
+        <h1 className="text-6xl md:text-7xl lg:text-8xl font-black leading-[0.85] tracking-tighter lowercase mb-8">
+          capture <br />
+          <span className="text-transparent bg-clip-text bg-gradient-to-r from-purple-400 via-fuchsia-400 to-blue-400">every</span> <br />
+          vibe.
+        </h1>
+        <p className="text-slate-400 text-lg md:text-xl max-w-md mx-auto lg:mx-0 mb-10 leading-relaxed font-medium">
+          Self-studio photobooth dengan kualitas tinggi. Ambil antrianmu secara digital dan nikmati momen seru.
+        </p>
+        
+        <button 
+          onClick={onStart}
+          disabled={!activeSession}
+          className="group relative inline-flex items-center gap-4 px-10 py-5 bg-white text-black rounded-2xl font-black uppercase tracking-widest text-sm transition-all hover:scale-105 active:scale-95 disabled:opacity-30 disabled:cursor-not-allowed"
+        >
+          {activeSession ? "Ambil Antrian Sekarang" : "Sesi Belum Dibuka"}
+          <span className="text-xl group-hover:translate-x-1 transition-transform">→</span>
+          <div className="absolute -inset-1 bg-white/20 blur opacity-0 group-hover:opacity-100 transition-opacity rounded-2xl" />
+        </button>
+      </div>
+
+      <div className="grid grid-cols-2 gap-4">
+        <div className="col-span-2 p-8 rounded-[2.5rem] bg-white/5 border border-white/10 backdrop-blur-xl relative overflow-hidden group">
+          <div className="absolute top-0 right-0 w-32 h-32 bg-purple-500/10 rounded-full blur-3xl group-hover:bg-purple-500/20 transition-colors" />
+          <p className="text-[10px] font-black uppercase tracking-widest text-purple-400 mb-3">Status Studio</p>
+          <h3 className="text-3xl font-black italic tracking-tighter">
+            {checkingSession ? "Memeriksa..." : activeSession ? activeSession.title : "Tutup"}
+          </h3>
+          <div className="flex items-center gap-2 mt-2">
+            <div className={`w-2 h-2 rounded-full ${activeSession ? 'bg-green-500 animate-pulse' : 'bg-red-500'}`} />
+            <p className="text-slate-500 text-xs font-bold uppercase tracking-tight">
+              {activeSession ? "Menerima Antrian" : "Tidak Ada Sesi Aktif"}
+            </p>
+          </div>
+        </div>
+        
+        <div className="p-6 rounded-[2rem] bg-white/[0.03] border border-white/5 hover:border-white/20 transition-colors">
+          <div className="text-2xl mb-2">⚡</div>
+          <h4 className="font-black uppercase text-xs tracking-widest">Cepat</h4>
+          <p className="text-[10px] text-slate-500 mt-1 font-medium">Tanpa antri fisik, cukup lewat HP.</p>
+        </div>
+        <div className="p-6 rounded-[2rem] bg-white/[0.03] border border-white/5 hover:border-white/20 transition-colors">
+          <div className="text-2xl mb-2">📸</div>
+          <h4 className="font-black uppercase text-xs tracking-widest">Premium</h4>
+          <p className="text-[10px] text-slate-500 mt-1 font-medium">Kualitas studio profesional.</p>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// --- QUEUE FORM COMPONENT ---
+function QueueFormPage({ 
+  isAdminLogin, loading, error, name, setName, phone, setPhone, 
+  email, setEmail, password, setPassword, handleSubmit, queueNumber, onBack, activeSession 
+}: any) {
+  
+  if (queueNumber) {
+    return (
+      <div className="max-w-md mx-auto w-full animate-in zoom-in-95 duration-500">
+        <div className="bg-[#0D0D10] border border-white/10 rounded-[3rem] p-10 text-center shadow-2xl relative overflow-hidden">
+          <div className="absolute top-0 inset-x-0 h-2 bg-gradient-to-r from-purple-600 via-fuchsia-500 to-blue-600" />
+          <div className="w-20 h-20 bg-green-500/20 rounded-full flex items-center justify-center mx-auto mb-6 ring-1 ring-green-500/50">
+             <svg className="w-10 h-10 text-green-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={3} d="M5 13l4 4L19 7" />
+             </svg>
+          </div>
+          <h2 className="text-3xl font-black italic tracking-tighter mb-2 text-white">BERHASIL!</h2>
+          <p className="text-slate-500 text-sm font-medium mb-8 uppercase tracking-widest">Nomor Antrian Kamu</p>
+          
+          <div className="bg-white/5 border border-white/5 rounded-[2rem] py-12 mb-8 group">
+            <span className="text-9xl font-black italic text-transparent bg-clip-text bg-gradient-to-b from-white to-slate-600 block transition-transform group-hover:scale-110 duration-500">
+              #{queueNumber}
+            </span>
+          </div>
+          <p className="text-[10px] text-slate-600 animate-pulse uppercase tracking-[0.3em] font-black">Mengarahkan ke tiket digital...</p>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="max-w-xl mx-auto w-full animate-in slide-in-from-bottom-10 duration-500">
+      {/* Header Form & Tombol Kembali */}
+      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 mb-8">
+        <div>
+          <h2 className="text-4xl font-black italic tracking-tighter uppercase text-white">
+            {isAdminLogin ? "Admin Login" : "Daftar Antrian"}
+          </h2>
+          <p className="text-slate-500 text-sm font-bold uppercase tracking-widest mt-1">
+            {isAdminLogin ? "Akses Terbatas" : activeSession?.title || "Sesi Tertutup"}
           </p>
         </div>
-      </footer>
+        
+        <button 
+          onClick={onBack} 
+          className="flex items-center justify-center gap-2 px-6 py-3 rounded-xl bg-white/5 border border-white/10 text-[10px] font-black uppercase tracking-widest text-slate-400 hover:text-white hover:bg-white/10 hover:border-white/20 transition-all active:scale-95"
+        >
+          <span>←</span> Kembali ke Beranda
+        </button>
+      </div>
+
+      <div className="bg-[#0D0D10] border border-white/10 rounded-[2.5rem] p-8 md:p-12 shadow-2xl relative overflow-hidden">
+        {/* Dekorasi kartu */}
+        <div className="absolute -top-24 -right-24 w-48 h-48 bg-purple-600/5 rounded-full blur-3xl" />
+        
+        <form onSubmit={handleSubmit} className="space-y-6 relative z-10">
+          {isAdminLogin ? (
+            <>
+              <Input label="Email Admin" type="email" value={email} onChange={setEmail} placeholder="admin@sayunk.com" />
+              <Input label="Password" type="password" value={password} onChange={setPassword} placeholder="••••••••" />
+            </>
+          ) : (
+            <>
+              <Input label="Nama Lengkap" type="text" value={name} onChange={setName} placeholder="Masukkan nama Anda..." />
+              <Input label="Nomor WhatsApp" type="tel" value={phone} onChange={setPhone} placeholder="0812 3456 7890" />
+              <div className="p-4 rounded-2xl bg-blue-500/5 border border-blue-500/10">
+                <p className="text-[9px] text-blue-400 font-bold uppercase tracking-widest leading-relaxed">
+                  Informasi: Nomor antrian akan diberikan setelah Anda menekan tombol di bawah.
+                </p>
+              </div>
+            </>
+          )}
+
+          {error && (
+            <div className="text-red-400 text-[10px] font-black uppercase tracking-widest p-4 bg-red-500/5 border border-red-500/20 rounded-xl animate-shake">
+              ⚠️ {error}
+            </div>
+          )}
+
+          <button
+            type="submit"
+            disabled={loading}
+            className="w-full py-5 bg-white text-black rounded-2xl font-black uppercase tracking-[0.2em] text-xs hover:bg-slate-200 transition-all active:scale-[0.98] disabled:opacity-50 shadow-[0_0_20px_rgba(255,255,255,0.1)]"
+          >
+            {loading ? "Memproses..." : isAdminLogin ? "Masuk Admin" : "Konfirmasi & Ambil Tiket"}
+          </button>
+        </form>
+      </div>
+
+      {/* Footer bantuan */}
+      <p className="text-center mt-8 text-[10px] text-slate-600 font-bold uppercase tracking-widest">
+        Butuh bantuan? Hubungi WhatsApp Admin di <span className="text-slate-400">0878-9371-0446</span>
+      </p>
     </div>
   );
 }
 
-function InfoPill({ title, desc }: { title: string; desc: string }) {
+// --- HELPER COMPONENT ---
+function Input({ label, type, value, onChange, placeholder }: any) {
   return (
-    <div className="rounded-2xl border border-white/8 bg-white/3 p-4">
-      <p className="text-sm font-black text-white tracking-tight">{title}</p>
-      <p className="mt-1 text-xs text-slate-500 leading-relaxed">{desc}</p>
-    </div>
-  );
-}
-
-function InputField({
-  label,
-  type,
-  placeholder,
-  value,
-  onChange,
-}: {
-  label: string;
-  type: string;
-  placeholder: string;
-  value: string;
-  onChange: (value: string) => void;
-}) {
-  return (
-    <div className="group space-y-2.5">
-      <label className="ml-1 text-[10px] font-black uppercase tracking-[0.22em] text-slate-500 group-focus-within:text-purple-400 transition-colors">
-        {label}
-      </label>
+    <div className="space-y-2">
+      <label className="text-[10px] font-black uppercase tracking-[0.2em] text-slate-500 ml-1">{label}</label>
       <input
-        type={type}
         required
+        type={type}
         value={value}
         onChange={(e) => onChange(e.target.value)}
         placeholder={placeholder}
-        className="w-full rounded-2xl border border-white/10 bg-white/3 px-6 py-4 text-white font-semibold outline-none transition-all placeholder:text-slate-700 focus:border-purple-500/50 focus:bg-white/5"
+        className="w-full bg-white/[0.03] border border-white/10 rounded-2xl px-6 py-4.5 text-white outline-none focus:border-purple-500/50 focus:bg-white/[0.07] transition-all placeholder:text-slate-700"
       />
     </div>
   );
 }
-
-function SocialLink({ href, icon }: { href: string; icon: React.ReactNode }) {
-  return (
-    <a
-      href={href}
-      target="_blank"
-      rel="noopener noreferrer"
-      className="flex h-12 w-12 items-center justify-center rounded-2xl border border-white/8 bg-white/3 text-slate-400 shadow-lg transition-all duration-300 hover:-translate-y-1 hover:bg-white/10 hover:text-white"
-    >
-      {icon}
-    </a>
-  );
-}
-
-const InstagramIcon = () => (
-  <svg className="w-5 h-5" viewBox="0 0 24 24" fill="none">
-    <defs>
-      <linearGradient id="ig-gradient" x1="0%" y1="0%" x2="100%" y2="100%">
-        <stop offset="0%" stopColor="#f58529" />
-        <stop offset="25%" stopColor="#dd2a7b" />
-        <stop offset="50%" stopColor="#8134af" />
-        <stop offset="75%" stopColor="#515bd4" />
-        <stop offset="100%" stopColor="#feda77" />
-      </linearGradient>
-    </defs>
-
-    <rect
-      x="3"
-      y="3"
-      width="18"
-      height="18"
-      rx="5"
-      stroke="url(#ig-gradient)"
-      strokeWidth="2"
-    />
-    <circle cx="12" cy="12" r="4" stroke="url(#ig-gradient)" strokeWidth="2" />
-    <circle cx="17" cy="7" r="1.2" fill="url(#ig-gradient)" />
-  </svg>
-);
-
-const WhatsAppIcon = () => (
-  <svg
-    className="w-5 h-5 text-green-400"
-    fill="currentColor"
-    viewBox="0 0 24 24"
-  >
-    <path d="M20.52 3.48A11.94 11.94 0 0012.06 0C5.46 0 .1 5.36.1 11.96c0 2.1.55 4.15 1.6 5.96L0 24l6.23-1.63a11.9 11.9 0 005.83 1.49h.01c6.6 0 11.96-5.36 11.96-11.96 0-3.2-1.25-6.2-3.5-8.42zM12.06 21.5c-1.8 0-3.56-.48-5.1-1.4l-.36-.21-3.7.97.99-3.6-.24-.37a9.46 9.46 0 01-1.45-5.03c0-5.22 4.24-9.46 9.46-9.46 2.53 0 4.9.99 6.68 2.77a9.43 9.43 0 012.78 6.7c0 5.22-4.24 9.46-9.46 9.46zm5.16-7.04c-.28-.14-1.65-.82-1.9-.91-.25-.09-.43-.14-.61.14-.18.28-.7.91-.86 1.1-.16.18-.32.2-.6.07-.28-.14-1.2-.44-2.28-1.4-.84-.75-1.4-1.67-1.57-1.95-.16-.28-.02-.43.12-.57.13-.13.28-.32.42-.48.14-.16.18-.28.28-.46.09-.18.05-.34-.02-.48-.07-.14-.61-1.47-.84-2.01-.22-.53-.45-.46-.61-.47l-.52-.01c-.18 0-.46.07-.7.34-.24.28-.92.9-.92 2.2 0 1.3.94 2.55 1.07 2.73.14.18 1.86 2.84 4.51 3.99.63.27 1.13.43 1.52.55.64.2 1.23.17 1.7.1.52-.08 1.65-.67 1.88-1.32.23-.65.23-1.2.16-1.32-.07-.11-.25-.18-.52-.32z" />
-  </svg>
-);
-
-const TikTokIcon = () => (
-  <svg className="w-5 h-5 text-white" fill="currentColor" viewBox="0 0 15 24">
-    <path d="M12.5 2c.4 3.2 2.6 5.2 5.7 5.4v3.1c-1.7 0-3.3-.5-4.7-1.4v5.5c0 4.5-3.7 8.2-8.2 8.2S-3 19.1-3 14.6 0.7 6.4 5.2 6.4c.4 0 .8 0 1.2.1v3.3c-.4-.1-.8-.2-1.2-.2-2.7 0-4.9 2.2-4.9 4.9s2.2 4.9 4.9 4.9 4.9-2.2 4.9-4.9V2h3.4z" />
-  </svg>
-);

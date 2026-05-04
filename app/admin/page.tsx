@@ -67,12 +67,14 @@ export default function AdminPage() {
 
   const [isWhatsAppModalOpen, setIsWhatsAppModalOpen] = useState(false);
   const [whatsAppData, setWhatsAppData] = useState<WhatsAppData | null>(null);
+  const [photoLink, setPhotoLink] = useState("");
 
   const [sessionHistory, setSessionHistory] = useState<QueueSession[]>([]);
   const [selectedSessionDetail, setSelectedSessionDetail] = useState<any>(null);
   const [isSessionDetailOpen, setIsSessionDetailOpen] = useState(false);
 
   const pollIntervalRef = useRef<NodeJS.Timeout | null>(null);
+  const fallbackIntervalRef = useRef<NodeJS.Timeout | null>(null);
 
   const getMonthStartJakarta = () => {
     const now = new Date();
@@ -305,9 +307,17 @@ export default function AdminPage() {
           console.log("Admin page: Session confirmed, loading data...");
           await refreshPageData();
 
+          // Polling lebih agresif untuk multi-device sync (1 detik instead of 2)
           pollIntervalRef.current = setInterval(async () => {
+            console.log("[Admin] Polling refresh data...");
             await refreshPageData();
-          }, 2000);
+          }, 1000);
+
+          // FALLBACK: Extra refresh every 5 seconds
+          fallbackIntervalRef.current = setInterval(async () => {
+            console.log("[Admin] 5s fallback refresh...");
+            await refreshPageData();
+          }, 5000);
 
           const channel = supabase
             .channel("queues-admin-and-sessions")
@@ -315,6 +325,7 @@ export default function AdminPage() {
               "postgres_changes",
               { event: "*", schema: "public", table: "queues" },
               () => {
+                console.log("[Admin] Real-time update: queues table changed");
                 refreshPageData();
               },
             )
@@ -322,6 +333,9 @@ export default function AdminPage() {
               "postgres_changes",
               { event: "*", schema: "public", table: "queue_sessions" },
               () => {
+                console.log(
+                  "[Admin] Real-time update: queue_sessions table changed",
+                );
                 refreshPageData();
               },
             )
@@ -345,11 +359,23 @@ export default function AdminPage() {
 
     setupAuthListener();
 
+    // Add visibility listener untuk admin page
+    const onVisibilityChange = () => {
+      if (document.visibilityState === "visible") {
+        console.log("[Admin] Page visible again, force refresh data...");
+        refreshPageData();
+      }
+    };
+    document.addEventListener("visibilitychange", onVisibilityChange);
+
     return () => {
       console.log("Admin page: Cleanup called");
       mounted = false;
       if (pollIntervalRef.current) clearInterval(pollIntervalRef.current);
+      if (fallbackIntervalRef.current)
+        clearInterval(fallbackIntervalRef.current);
       if (subscription) supabase.removeChannel(subscription);
+      document.removeEventListener("visibilitychange", onVisibilityChange);
     };
   }, [router]);
 
@@ -528,50 +554,168 @@ export default function AdminPage() {
     }
   };
 
-  const exportToExcel = () => {
-    const dataExport = queues
-      .filter((q) => q.status === "selesai")
-      .map((q) => ({
+  const exportToExcel = async () => {
+    try {
+      // Filter completed queues
+      const completedQueues = queues.filter((q) => q.status === "selesai");
+
+      if (completedQueues.length === 0) {
+        alert(
+          "Tidak ada data yang bisa diekspor. Pastikan ada queue dengan status 'selesai'.",
+        );
+        return;
+      }
+
+      // Prepare data for export
+      const dataExport = completedQueues.map((q) => ({
         Sesi: activeSession?.title || "-",
         Nama: getUserName(q.users),
         Nomor_Antrian: q.queue_number,
-        Harga: q.price,
-        Tanggal: new Date(q.created_at).toLocaleDateString("id-ID", {
-          timeZone: "Asia/Jakarta",
-        }),
+        Harga: q.price || 0,
+        Tanggal: q.created_at
+          ? new Date(q.created_at).toLocaleDateString("id-ID", {
+              timeZone: "Asia/Jakarta",
+            })
+          : "-",
       }));
 
-    const worksheet = XLSX.utils.json_to_sheet(dataExport);
-    const workbook = XLSX.utils.book_new();
-    XLSX.utils.book_append_sheet(workbook, worksheet, "Laporan");
-    const excelBuffer = XLSX.write(workbook, {
-      bookType: "xlsx",
-      type: "array",
-    });
+      // Create worksheet and workbook
+      const worksheet = XLSX.utils.json_to_sheet(dataExport);
 
-    const file = new Blob([excelBuffer], { type: "application/octet-stream" });
-    saveAs(file, "laporan-photobox.xlsx");
+      // Set column widths
+      const colWidths = [
+        { wch: 25 }, // Sesi
+        { wch: 20 }, // Nama
+        { wch: 15 }, // Nomor Antrian
+        { wch: 15 }, // Harga
+        { wch: 15 }, // Tanggal
+      ];
+      worksheet["!cols"] = colWidths;
+
+      const workbook = XLSX.utils.book_new();
+      XLSX.utils.book_append_sheet(workbook, worksheet, "Laporan");
+
+      // Generate filename with current date
+      const today = new Date().toLocaleDateString("id-ID", {
+        timeZone: "Asia/Jakarta",
+      });
+      const filename = `laporan-photobox-${today}.xlsx`;
+
+      // Write and save file
+      XLSX.writeFile(workbook, filename);
+
+      alert(`✅ Export berhasil! File: ${filename}`);
+    } catch (error) {
+      console.error("Export error:", error);
+      alert("❌ Gagal mengekspor file. Silakan coba lagi.");
+    }
+  };
+
+  const exportSessionToExcel = async () => {
+    try {
+      if (!selectedSessionDetail) {
+        alert("❌ Data sesi tidak ditemukan.");
+        return;
+      }
+
+      // Fetch all queues for this specific session
+      const { data: queuesData, error } = await supabase
+        .from("queues")
+        .select(
+          "id, queue_number, status, price, created_at, users(name, phone)",
+        )
+        .eq("session_id", selectedSessionDetail.id)
+        .order("queue_number", { ascending: true });
+
+      if (error) {
+        console.error("Fetch queues error:", error.message);
+        throw error;
+      }
+
+      if (!queuesData || queuesData.length === 0) {
+        alert("❌ Tidak ada data queue untuk sesi ini.");
+        return;
+      }
+
+      // Prepare data for export
+      const dataExport = (queuesData as Queue[]).map((q) => ({
+        Sesi: selectedSessionDetail.title,
+        Nama: getUserName(q.users),
+        Nomor_Antrian: q.queue_number,
+        Status: q.status.toUpperCase(),
+        Harga: q.price || 0,
+        Tanggal: q.created_at
+          ? new Date(q.created_at).toLocaleDateString("id-ID", {
+              timeZone: "Asia/Jakarta",
+            })
+          : "-",
+      }));
+
+      // Create worksheet and workbook
+      const worksheet = XLSX.utils.json_to_sheet(dataExport);
+
+      // Set column widths
+      const colWidths = [
+        { wch: 30 }, // Sesi
+        { wch: 20 }, // Nama
+        { wch: 15 }, // Nomor Antrian
+        { wch: 15 }, // Status
+        { wch: 15 }, // Harga
+        { wch: 15 }, // Tanggal
+      ];
+      worksheet["!cols"] = colWidths;
+
+      const workbook = XLSX.utils.book_new();
+      XLSX.utils.book_append_sheet(workbook, worksheet, "Session Data");
+
+      // Generate filename with session title and date
+      const sanitizedTitle = selectedSessionDetail.title
+        .replace(/[^a-zA-Z0-9]/g, "-")
+        .toLowerCase();
+      const sessionDate = new Date(
+        selectedSessionDetail.started_at,
+      ).toLocaleDateString("id-ID", { timeZone: "Asia/Jakarta" });
+      const filename = `session-${sanitizedTitle}-${sessionDate}.xlsx`;
+
+      // Write and save file
+      XLSX.writeFile(workbook, filename);
+
+      alert(
+        `✅ Export sesi berhasil! File: ${filename}\n\nTotal data: ${dataExport.length} queue`,
+      );
+    } catch (error) {
+      console.error("Export session error:", error);
+      alert("❌ Gagal mengekspor sesi. Silakan coba lagi.");
+    }
   };
 
   return (
-    <div className="min-h-screen bg-[#050505] text-white font-sans selection:bg-purple-500 overflow-x-hidden">
-      <div className="absolute inset-0 opacity-[0.025] pointer-events-none">
-        <div
-          className="w-full h-full"
-          style={{
-            backgroundImage: "radial-gradient(#ffffff 1px, transparent 1px)",
-            backgroundSize: "26px 26px",
-          }}
-        />
+    <div className="min-h-screen bg-linear-to-br from-slate-950 via-slate-900 to-slate-950 text-white font-sans selection:bg-purple-500 selection:text-white overflow-x-hidden">
+      {/* Animated Background Elements */}
+      <div className="fixed inset-0 overflow-hidden pointer-events-none">
+        <div className="absolute inset-0 opacity-20">
+          <div
+            className="w-full h-full"
+            style={{
+              backgroundImage: "radial-gradient(#ffffff 1px, transparent 1px)",
+              backgroundSize: "26px 26px",
+            }}
+          />
+        </div>
+
+        {/* Animated Gradient Orbs */}
+        <div className="absolute -top-40 -right-40 w-80 h-80 bg-purple-600/20 rounded-full filter blur-3xl animate-pulse" />
+        <div className="absolute top-1/3 -left-40 w-80 h-80 bg-blue-600/20 rounded-full filter blur-3xl animate-pulse animation-delay-2000" />
+        <div className="absolute -bottom-40 right-1/3 w-96 h-96 bg-indigo-600/15 rounded-full filter blur-3xl animate-pulse animation-delay-4000" />
       </div>
 
-      <div className="flex min-h-screen flex-col md:flex-row relative">
-        <aside className="w-full md:w-72 bg-[#09090B]/95 backdrop-blur-xl border-r border-white/5 flex flex-col md:sticky md:top-0 md:h-screen z-40">
+      <div className="flex min-h-screen flex-col md:flex-row relative z-10">
+        <aside className="w-full md:w-64 lg:w-72 bg-linear-to-b from-slate-900/95 to-slate-950/95 backdrop-blur-2xl border-b md:border-b-0 md:border-r border-white/5 flex flex-col md:sticky md:top-0 md:h-screen z-40 shadow-2xl">
           <div className="flex flex-col h-full justify-between">
-            <div className="p-7">
-              <div className="flex items-center gap-4 mb-10">
-                <div className="relative p-1.5 bg-white/5 border border-white/10 rounded-2xl shadow-lg">
-                  <div className="relative w-11 h-11 overflow-hidden">
+            <div className="p-4 sm:p-5 md:p-6 lg:p-7">
+              <div className="flex items-center gap-3 sm:gap-4 mb-8 sm:mb-10 group">
+                <div className="relative p-1.5 bg-linear-to-br from-white/10 to-white/5 border border-white/15 rounded-2xl shadow-lg group-hover:shadow-purple-500/20 group-hover:border-purple-500/30 transition-all duration-300">
+                  <div className="relative w-11 h-11 overflow-hidden rounded-xl">
                     <Image
                       src="/logo.png"
                       alt="Sayunk.Photobooth"
@@ -587,7 +731,7 @@ export default function AdminPage() {
                   <span className="font-black tracking-tighter uppercase italic text-sm text-white leading-none">
                     Sayunk
                   </span>
-                  <span className="font-bold tracking-[0.22em] uppercase text-[8px] text-purple-400 mt-1">
+                  <span className="font-bold tracking-[0.22em] uppercase text-[8px] bg-linear-to-r from-purple-400 to-blue-400 bg-clip-text text-transparent mt-1">
                     Photobooth
                   </span>
                 </div>
@@ -617,19 +761,19 @@ export default function AdminPage() {
               </nav>
             </div>
 
-            <div className="p-6 border-t border-white/5 bg-white/2">
-              <div className="rounded-3xl border border-white/8 bg-linear-to-br from-green-500/10 to-emerald-500/5 p-4 mb-4">
+            <div className="p-6 border-t border-white/5 bg-linear-to-t from-slate-950/50 to-transparent">
+              <div className="rounded-3xl border border-white/10 bg-linear-to-br from-green-500/15 to-emerald-500/5 p-4 mb-4 shadow-lg shadow-green-500/10 hover:shadow-green-500/20 transition-all">
                 <p className="text-[9px] font-black text-slate-500 uppercase tracking-[0.24em] mb-2">
-                  This Month
+                  This Month Revenue
                 </p>
-                <p className="text-xl font-black text-green-400 leading-none tracking-tighter">
+                <p className="text-xl font-black text-green-300 leading-none tracking-tighter">
                   Rp {thisMonthRevenue.toLocaleString("id-ID")}
                 </p>
               </div>
 
               <button
                 onClick={logout}
-                className="w-full flex items-center justify-center gap-2 py-3 border border-red-500/25 text-red-400 hover:bg-red-500 hover:text-white rounded-2xl text-[10px] font-black uppercase tracking-[0.22em] transition-all active:scale-95"
+                className="w-full flex items-center justify-center gap-2 py-3 border border-red-500/30 bg-red-500/5 text-red-400 hover:bg-red-500/20 hover:text-red-200 hover:border-red-500/50 rounded-2xl text-[10px] font-black uppercase tracking-[0.22em] transition-all active:scale-95 shadow-lg shadow-red-500/5"
               >
                 <svg
                   className="w-3.5 h-3.5"
@@ -651,13 +795,13 @@ export default function AdminPage() {
         </aside>
 
         <div className="flex-1 overflow-x-hidden relative">
-          <header className="sticky top-0 z-30 border-b border-white/5 bg-[#0A0A0A]/80 backdrop-blur-xl">
-            <div className="px-6 md:px-10 py-6 max-w-400 mx-auto flex items-center justify-between gap-4">
+          <header className="sticky top-0 z-30 border-b border-white/5 bg-linear-to-b from-slate-900/80 to-slate-950/80 backdrop-blur-2xl shadow-lg shadow-black/50">
+            <div className="px-4 sm:px-6 md:px-8 lg:px-10 py-4 sm:py-5 md:py-6 max-w-7xl mx-auto flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 sm:gap-4 w-full">
               <div>
-                <p className="text-[10px] font-black uppercase tracking-[0.3em] text-slate-500 mb-2">
+                <p className="text-[9px] sm:text-[10px] font-black uppercase tracking-[0.3em] text-slate-500 mb-1 sm:mb-2">
                   Admin Dashboard
                 </p>
-                <h1 className="text-2xl md:text-3xl font-black tracking-tighter uppercase italic">
+                <h1 className="text-lg sm:text-2xl md:text-3xl font-black tracking-tighter uppercase italic bg-linear-to-r from-white via-slate-200 to-slate-400 bg-clip-text text-transparent">
                   {activeTab === "antrian"
                     ? "Session Control"
                     : activeTab === "pendapatan"
@@ -668,39 +812,41 @@ export default function AdminPage() {
                 </h1>
               </div>
 
-              <div className="hidden md:flex items-center gap-2 px-4 py-2 rounded-full bg-white/5 border border-white/10">
+              <div className="hidden sm:flex items-center gap-2 sm:gap-3 px-3 sm:px-4 md:px-5 py-2 sm:py-3 rounded-full bg-linear-to-r from-white/5 to-white/0 border border-white/10 shadow-lg shadow-black/20 shrink-0">
                 <span
-                  className={`w-2 h-2 rounded-full ${
-                    activeSession ? "bg-green-500 animate-pulse" : "bg-red-500"
+                  className={`w-2 sm:w-2.5 h-2 sm:h-2.5 rounded-full ${
+                    activeSession
+                      ? "bg-green-400 animate-pulse shadow-lg shadow-green-500/50"
+                      : "bg-red-500/70"
                   }`}
                 />
-                <span className="text-[10px] font-bold text-gray-400 uppercase tracking-[0.22em]">
-                  {activeSession ? "Session Active" : "No Active Session"}
+                <span className="text-[8px] sm:text-[9px] md:text-[10px] font-bold text-slate-300 uppercase tracking-[0.2em] sm:tracking-[0.22em]">
+                  {activeSession ? "Active" : "No Session"}
                 </span>
               </div>
             </div>
           </header>
 
-          <main className="p-6 md:p-10 max-w-400 mx-auto">
+          <main className="p-4 sm:p-6 md:p-8 lg:p-10 w-full mx-auto">
             {activeTab === "antrian" ? (
               <>
                 {/* SESSION CONTROL */}
-                <div className="mb-8 grid grid-cols-1 xl:grid-cols-12 gap-6">
+                <div className="mb-8 grid grid-cols-1 xl:grid-cols-12 gap-6 animate-in fade-in duration-500">
                   {!activeSession ? (
                     <>
                       {/* LEFT - INFO */}
-                      <div className="xl:col-span-7 rounded-4x1 border border-white/8 bg-white/3 p-8 md:p-10">
-                        <p className="text-[10px] font-black uppercase tracking-[0.3em] text-slate-500 mb-3">
+                      <div className="lg:col-span-7 rounded-2xl sm:rounded-3xl border border-white/10 bg-linear-to-br from-white/5 to-white/0 p-5 sm:p-6 md:p-8 lg:p-10 shadow-xl shadow-black/30 hover:shadow-purple-500/10 hover:border-white/20 transition-all duration-300">
+                        <p className="text-[9px] sm:text-[10px] font-black uppercase tracking-[0.3em] text-slate-500 mb-2 sm:mb-3">
                           Session Setup
                         </p>
 
-                        <h2 className="text-3xl md:text-4xl font-black italic tracking-tighter text-white mb-4">
+                        <h2 className="text-2xl sm:text-3xl lg:text-4xl font-black italic tracking-tighter text-white mb-3 sm:mb-4">
                           Belum Ada Sesi Aktif
                         </h2>
 
-                        <p className="text-slate-500 text-sm max-w-md leading-relaxed">
+                        <p className="text-slate-400 text-xs sm:text-sm max-w-md leading-relaxed mb-4 sm:mb-6">
                           Buat sesi baru untuk memulai antrian dari nomor 1.
-                          Semua data sebelumnya tetap aman.
+                          Semua data sebelumnya tetap aman dan terjaga.
                         </p>
 
                         <div className="mt-6">
@@ -709,18 +855,19 @@ export default function AdminPage() {
                             placeholder="Contoh: Pernikahan Desa Makmur"
                             value={sessionTitle}
                             onChange={(e) => setSessionTitle(e.target.value)}
-                            className="w-full rounded-2xl border border-white/10 bg-white/3 px-6 py-4 text-white font-semibold outline-none placeholder:text-slate-700 focus:border-purple-500/50 focus:bg-white/5"
+                            className="w-full rounded-xl sm:rounded-2xl border border-white/15 bg-linear-to-br from-white/5 to-white/2 px-4 sm:px-6 py-3 sm:py-4 text-white font-semibold outline-none placeholder:text-slate-600 focus:border-green-400 focus:bg-white/10 focus:shadow-lg focus:shadow-green-500/20 transition-all text-sm"
                           />
                         </div>
                       </div>
 
                       {/* RIGHT - ACTION */}
-                      <div className="xl:col-span-5 flex items-center">
+                      <div className="lg:col-span-5 flex items-center min-h-24 sm:min-h-28 lg:min-h-32">
                         <button
                           onClick={startSession}
                           disabled={sessionLoading}
-                          className="w-full h-full min-h-30 rounded-4x1 bg-linear-to-r from-purple-600 to-blue-600 hover:brightness-110 text-white font-black text-sm uppercase tracking-[0.22em] transition-all shadow-xl shadow-purple-900/30 disabled:opacity-50"
+                          className="w-full h-full rounded-2xl sm:rounded-3xl bg-linear-to-r from-purple-600 via-purple-500 to-blue-600 hover:shadow-2xl hover:shadow-purple-500/50 text-white font-black text-xs sm:text-sm uppercase tracking-[0.2em] sm:tracking-[0.22em] transition-all shadow-xl shadow-purple-900/40 disabled:opacity-50 active:scale-95 relative overflow-hidden group"
                         >
+                          <div className="absolute inset-0 bg-linear-to-r from-transparent via-white/10 to-transparent -translate-x-full group-hover:translate-x-full transition-transform duration-500 pointer-events-none" />
                           {sessionLoading ? "Processing..." : "Mulai Kerja"}
                         </button>
                       </div>
@@ -728,9 +875,9 @@ export default function AdminPage() {
                   ) : (
                     <>
                       {/* LEFT - INFO SESSION */}
-                      <div className="xl:col-span-7 rounded-4x1 border border-white/8 bg-white/3 p-8 md:p-10">
+                      <div className="xl:col-span-7 rounded-3xl border border-white/10 bg-linear-to-br from-green-500/10 to-emerald-500/5 p-8 md:p-10 shadow-xl shadow-green-500/10 hover:shadow-green-500/20 transition-all duration-300">
                         <div className="flex items-center gap-3 mb-5">
-                          <span className="w-2 h-2 rounded-full bg-green-500 animate-pulse" />
+                          <span className="w-3 h-3 rounded-full bg-green-400 animate-pulse shadow-lg shadow-green-500/50" />
                           <p className="text-[10px] font-black uppercase tracking-[0.3em] text-green-400">
                             Active Session
                           </p>
@@ -761,7 +908,7 @@ export default function AdminPage() {
                         <button
                           onClick={endSession}
                           disabled={sessionLoading}
-                          className="w-full h-full min-h-30 rounded-4x1 border border-red-500/25 bg-red-500/10 hover:bg-red-500 text-red-300 hover:text-white font-black text-sm uppercase tracking-[0.22em] transition-all disabled:opacity-50"
+                          className="w-full h-full min-h-30 rounded-3xl border border-red-500/40 bg-red-500/10 hover:bg-red-500/20 text-red-300 hover:text-red-100 hover:border-red-500/60 font-black text-sm uppercase tracking-[0.22em] transition-all shadow-xl shadow-red-500/10 hover:shadow-red-500/20 disabled:opacity-50 active:scale-95"
                         >
                           {sessionLoading ? "Processing..." : "Selesaikan Sesi"}
                         </button>
@@ -771,7 +918,7 @@ export default function AdminPage() {
                 </div>
 
                 {/* STATS */}
-                <div className="grid grid-cols-1 md:grid-cols-3 gap-6 mb-8">
+                <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3 sm:gap-4 md:gap-6 mb-6 sm:mb-8 animate-in fade-in duration-500 animation-delay-200">
                   <StatCard
                     title="Done Today"
                     value={getByStatus("selesai").length}
@@ -803,7 +950,7 @@ export default function AdminPage() {
                     </p>
                   </div>
                 ) : (
-                  <div className="grid grid-cols-1 lg:grid-cols-2 xl:grid-cols-4 gap-6">
+                  <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-3 sm:gap-4 md:gap-5 lg:gap-6">
                     <Column
                       title="Pending Confirmation"
                       count={getByStatus("pending_confirmation").length}
@@ -908,67 +1055,67 @@ export default function AdminPage() {
                 )}
               </>
             ) : activeTab === "pendapatan" ? (
-              <div className="space-y-8 animate-in fade-in duration-500">
-                <div className="grid grid-cols-1 xl:grid-cols-12 gap-6">
-                  <div className="xl:col-span-4 rounded-4xl border border-white/8 bg-linear-to-br from-green-500/15 to-green-500/5 p-8 md:p-10">
-                    <p className="text-[10px] font-black uppercase tracking-[0.3em] text-slate-500 mb-4">
+              <div className="space-y-6 sm:space-y-8 animate-in fade-in duration-500">
+                <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-12 gap-3 sm:gap-4 md:gap-5 lg:gap-6">
+                  <div className="sm:col-span-2 lg:col-span-1 xl:col-span-4 rounded-2xl sm:rounded-3xl md:rounded-4xl border border-white/8 bg-linear-to-br from-green-500/15 to-green-500/5 p-5 sm:p-6 md:p-8 lg:p-10">
+                    <p className="text-[8px] sm:text-[9px] md:text-[10px] font-black uppercase tracking-[0.25em] sm:tracking-[0.27em] md:tracking-[0.3em] text-slate-500 mb-2 sm:mb-3 md:mb-4">
                       Revenue Today
                     </p>
-                    <h2 className="text-4xl md:text-5xl font-black italic tracking-tighter text-white leading-none">
+                    <h2 className="text-2xl sm:text-3xl md:text-4xl lg:text-5xl font-black italic tracking-tighter text-white leading-none">
                       Rp {todayRevenue.toLocaleString("id-ID")}
                     </h2>
-                    <p className="mt-4 text-xs font-bold uppercase tracking-[0.18em] text-slate-500">
+                    <p className="mt-3 sm:mt-4 text-[7px] sm:text-[8px] md:text-xs font-bold uppercase tracking-[0.15em] sm:tracking-[0.18em] text-slate-500">
                       Pendapatan sesi aktif
                     </p>
                   </div>
 
-                  <div className="xl:col-span-4 rounded-4xl border border-white/8 bg-linear-to-br from-sky-500/15 to-sky-500/5 p-8 md:p-10">
-                    <p className="text-[10px] font-black uppercase tracking-[0.3em] text-slate-500 mb-4">
+                  <div className="sm:col-span-2 lg:col-span-1 xl:col-span-4 rounded-2xl sm:rounded-3xl md:rounded-4xl border border-white/8 bg-linear-to-br from-sky-500/15 to-sky-500/5 p-5 sm:p-6 md:p-8 lg:p-10">
+                    <p className="text-[8px] sm:text-[9px] md:text-[10px] font-black uppercase tracking-[0.25em] sm:tracking-[0.27em] md:tracking-[0.3em] text-slate-500 mb-2 sm:mb-3 md:mb-4">
                       Revenue Month
                     </p>
-                    <h2 className="text-4xl md:text-5xl font-black italic tracking-tighter text-white leading-none">
+                    <h2 className="text-2xl sm:text-3xl md:text-4xl lg:text-5xl font-black italic tracking-tighter text-white leading-none">
                       Rp {thisMonthRevenue.toLocaleString("id-ID")}
                     </h2>
-                    <p className="mt-4 text-xs font-bold uppercase tracking-[0.18em] text-slate-500">
+                    <p className="mt-3 sm:mt-4 text-[7px] sm:text-[8px] md:text-xs font-bold uppercase tracking-[0.15em] sm:tracking-[0.18em] text-slate-500">
                       Pendapatan bulan ini
                     </p>
                   </div>
 
-                  <div className="xl:col-span-4 rounded-4xl border border-white/10 bg-linear-to-br from-purple-600/20 to-blue-600/20 p-8 md:p-10">
-                    <p className="text-[10px] font-black uppercase tracking-[0.3em] text-slate-400 mb-4">
+                  <div className="sm:col-span-2 lg:col-span-1 xl:col-span-4 rounded-2xl sm:rounded-3xl md:rounded-4xl border border-white/10 bg-linear-to-br from-purple-600/20 to-blue-600/20 p-5 sm:p-6 md:p-8 lg:p-10">
+                    <p className="text-[8px] sm:text-[9px] md:text-[10px] font-black uppercase tracking-[0.25em] sm:tracking-[0.27em] md:tracking-[0.3em] text-slate-400 mb-2 sm:mb-3 md:mb-4">
                       Active Session
                     </p>
-                    <h2 className="text-2xl md:text-3xl font-black italic tracking-tighter text-white leading-tight">
+                    <h2 className="text-lg sm:text-xl md:text-2xl lg:text-3xl font-black italic tracking-tighter text-white leading-tight">
                       {activeSession?.title || "Tidak ada sesi aktif"}
                     </h2>
-                    <p className="mt-4 text-xs font-bold uppercase tracking-[0.18em] text-slate-400">
+                    <p className="mt-3 sm:mt-4 text-[7px] sm:text-[8px] md:text-xs font-bold uppercase tracking-[0.15em] sm:tracking-[0.18em] text-slate-400">
                       Session title
                     </p>
                   </div>
                 </div>
 
-                <div className="grid grid-cols-1 xl:grid-cols-12 gap-6">
-                  <div className="xl:col-span-8 rounded-4xl border border-white/8 bg-white/3 p-8 md:p-10">
-                    <div className="flex flex-col md:flex-row md:items-center md:justify-between gap-4 mb-8">
+                <div className="grid grid-cols-1 lg:grid-cols-12 gap-4 sm:gap-5 md:gap-6">
+                  <div className="lg:col-span-8 rounded-2xl sm:rounded-3xl md:rounded-4xl border border-white/8 bg-white/3 p-4 sm:p-5 md:p-6 lg:p-8">
+                    <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 sm:gap-4 mb-6 sm:mb-8">
                       <div>
-                        <p className="text-[10px] font-black uppercase tracking-[0.3em] text-slate-500 mb-2">
+                        <p className="text-[8px] sm:text-[9px] md:text-[10px] font-black uppercase tracking-[0.25em] sm:tracking-[0.27em] md:tracking-[0.3em] text-slate-500 mb-1 sm:mb-2">
                           Performance Chart
                         </p>
-                        <h3 className="text-2xl font-black italic tracking-tighter text-white">
+                        <h3 className="text-lg sm:text-xl md:text-2xl font-black italic tracking-tighter text-white">
                           Financial Report
                         </h3>
                       </div>
 
                       <button
                         onClick={exportToExcel}
-                        className="px-6 py-3 rounded-2xl border border-green-500/25 bg-green-500/10 text-green-400 hover:bg-green-500 hover:text-white text-[10px] font-black uppercase tracking-[0.24em] transition-all"
+                        className="px-4 sm:px-5 md:px-6 py-2 sm:py-2.5 md:py-3 rounded-xl sm:rounded-2xl border border-green-500/25 bg-green-500/10 text-green-400 hover:bg-green-500 hover:text-white text-[7px] sm:text-[8px] md:text-[9px] lg:text-[10px] font-black uppercase tracking-[0.2em] sm:tracking-[0.22em] md:tracking-[0.24em] transition-all shrink-0"
                       >
                         Export XLSX
                       </button>
                     </div>
 
-                    <div className="rounded-4xl border border-white/6 bg-black/20 p-4 md:p-6">
-                      <div className="h-90">
+                    <div className="rounded-2xl sm:rounded-3xl md:rounded-4xl border border-white/6 bg-black/20 p-3 sm:p-4 md:p-6">
+                      <div className="h-80 sm:h-90 md:h-96">
                         <ResponsiveContainer width="100%" height="100%">
                           <LineChart data={dailyData}>
                             <XAxis
@@ -998,17 +1145,17 @@ export default function AdminPage() {
                     </div>
                   </div>
 
-                  <div className="xl:col-span-4 rounded-4xl border border-white/8 bg-white/3 p-8">
-                    <div className="mb-6">
-                      <p className="text-[10px] font-black uppercase tracking-[0.3em] text-slate-500 mb-2">
+                  <div className="lg:col-span-4 rounded-2xl sm:rounded-3xl md:rounded-4xl border border-white/8 bg-white/3 p-4 sm:p-5 md:p-6 lg:p-8">
+                    <div className="mb-4 sm:mb-5 md:mb-6">
+                      <p className="text-[8px] sm:text-[9px] md:text-[10px] font-black uppercase tracking-[0.25em] sm:tracking-[0.27em] md:tracking-[0.3em] text-slate-500 mb-1 sm:mb-2">
                         Latest Payments
                       </p>
-                      <h3 className="text-2xl font-black italic tracking-tighter text-white">
+                      <h3 className="text-lg sm:text-xl md:text-2xl font-black italic tracking-tighter text-white">
                         Recent Transactions
                       </h3>
                     </div>
 
-                    <div className="space-y-3 max-h-90 overflow-y-auto pr-2">
+                    <div className="space-y-2 sm:space-y-3 max-h-80 sm:max-h-90 md:max-h-96 overflow-y-auto pr-2 custom-scrollbar">
                       {getByStatus("selesai")
                         .slice()
                         .reverse()
@@ -1016,10 +1163,10 @@ export default function AdminPage() {
                         .map((q) => (
                           <div
                             key={q.id}
-                            className="rounded-3xl border border-white/6 bg-white/3 p-4 hover:border-white/10 transition-all"
+                            className="rounded-2xl sm:rounded-3xl border border-white/6 bg-white/3 p-3 sm:p-4 hover:border-white/10 transition-all"
                           >
-                            <div className="flex items-center justify-between gap-3">
-                              <div className="flex items-center gap-3 min-w-0">
+                            <div className="flex items-center justify-between gap-2 sm:gap-3">
+                              <div className="flex items-center gap-2 sm:gap-3 min-w-0">
                                 <div className="w-11 h-11 rounded-2xl bg-linear-to-tr from-purple-600/20 to-blue-600/20 flex items-center justify-center font-black text-xs shrink-0">
                                   #{q.queue_number}
                                 </div>
@@ -1052,25 +1199,25 @@ export default function AdminPage() {
                 </div>
               </div>
             ) : activeTab === "history" ? (
-              <div className="space-y-8 animate-in fade-in duration-500">
-                <div className="grid grid-cols-1 xl:grid-cols-12 gap-6">
-                  <div className="xl:col-span-4 rounded-4xl border border-white/8 bg-linear-to-br from-purple-500/15 to-purple-500/5 p-8 md:p-10">
-                    <p className="text-[10px] font-black uppercase tracking-[0.3em] text-slate-500 mb-4">
+              <div className="space-y-6 sm:space-y-8 animate-in fade-in duration-500">
+                <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-12 gap-3 sm:gap-4 md:gap-5 lg:gap-6">
+                  <div className="sm:col-span-2 lg:col-span-1 xl:col-span-4 rounded-2xl sm:rounded-3xl md:rounded-4xl border border-white/8 bg-linear-to-br from-purple-500/15 to-purple-500/5 p-5 sm:p-6 md:p-8 lg:p-10">
+                    <p className="text-[8px] sm:text-[9px] md:text-[10px] font-black uppercase tracking-[0.25em] sm:tracking-[0.27em] md:tracking-[0.3em] text-slate-500 mb-2 sm:mb-3 md:mb-4">
                       Total Session
                     </p>
-                    <h2 className="text-4xl md:text-5xl font-black italic tracking-tighter text-white leading-none">
+                    <h2 className="text-2xl sm:text-3xl md:text-4xl lg:text-5xl font-black italic tracking-tighter text-white leading-none">
                       {sessionHistory.length}
                     </h2>
-                    <p className="mt-4 text-xs font-bold uppercase tracking-[0.18em] text-slate-500">
+                    <p className="mt-3 sm:mt-4 text-[7px] sm:text-[8px] md:text-xs font-bold uppercase tracking-[0.15em] sm:tracking-[0.18em] text-slate-500">
                       Total sesi selesai
                     </p>
                   </div>
 
-                  <div className="xl:col-span-4 rounded-4xl border border-white/8 bg-linear-to-br from-green-500/15 to-green-500/5 p-8 md:p-10">
-                    <p className="text-[10px] font-black uppercase tracking-[0.3em] text-slate-500 mb-4">
+                  <div className="sm:col-span-2 lg:col-span-1 xl:col-span-4 rounded-2xl sm:rounded-3xl md:rounded-4xl border border-white/8 bg-linear-to-br from-green-500/15 to-green-500/5 p-5 sm:p-6 md:p-8 lg:p-10">
+                    <p className="text-[8px] sm:text-[9px] md:text-[10px] font-black uppercase tracking-[0.25em] sm:tracking-[0.27em] md:tracking-[0.3em] text-slate-500 mb-2 sm:mb-3 md:mb-4">
                       Revenue History
                     </p>
-                    <h2 className="text-4xl md:text-5xl font-black italic tracking-tighter text-white leading-none">
+                    <h2 className="text-2xl sm:text-3xl md:text-4xl lg:text-5xl font-black italic tracking-tighter text-white leading-none">
                       Rp{" "}
                       {sessionHistory
                         .reduce(
@@ -1080,89 +1227,95 @@ export default function AdminPage() {
                         )
                         .toLocaleString("id-ID")}
                     </h2>
-                    <p className="mt-4 text-xs font-bold uppercase tracking-[0.18em] text-slate-500">
+                    <p className="mt-3 sm:mt-4 text-[7px] sm:text-[8px] md:text-xs font-bold uppercase tracking-[0.15em] sm:tracking-[0.18em] text-slate-500">
                       Total pendapatan histori
                     </p>
                   </div>
 
-                  <div className="xl:col-span-4 rounded-4xl border border-white/10 bg-linear-to-br from-blue-600/20 to-cyan-600/20 p-8 md:p-10">
-                    <p className="text-[10px] font-black uppercase tracking-[0.3em] text-slate-400 mb-4">
+                  <div className="sm:col-span-2 lg:col-span-1 xl:col-span-4 rounded-2xl sm:rounded-3xl md:rounded-4xl border border-white/10 bg-linear-to-br from-blue-600/20 to-cyan-600/20 p-5 sm:p-6 md:p-8 lg:p-10">
+                    <p className="text-[8px] sm:text-[9px] md:text-[10px] font-black uppercase tracking-[0.25em] sm:tracking-[0.27em] md:tracking-[0.3em] text-slate-400 mb-2 sm:mb-3 md:mb-4">
                       Latest Closed Session
                     </p>
-                    <h2 className="text-2xl md:text-3xl font-black italic tracking-tighter text-white leading-tight">
+                    <h2 className="text-lg sm:text-xl md:text-2xl lg:text-3xl font-black italic tracking-tighter text-white leading-tight">
                       {sessionHistory[0]?.title || "Belum ada sesi selesai"}
                     </h2>
-                    <p className="mt-4 text-xs font-bold uppercase tracking-[0.18em] text-slate-400">
+                    <p className="mt-3 sm:mt-4 text-[7px] sm:text-[8px] md:text-xs font-bold uppercase tracking-[0.15em] sm:tracking-[0.18em] text-slate-400">
                       Session terbaru
                     </p>
                   </div>
                 </div>
 
-                <div className="rounded-4xl border border-white/8 bg-white/3 p-8 md:p-10">
-                  <div className="flex flex-col md:flex-row md:items-center md:justify-between gap-4 mb-8">
+                <div className="rounded-2xl sm:rounded-3xl border border-white/10 bg-linear-to-br from-white/5 to-white/0 p-4 sm:p-5 md:p-6 lg:p-8 shadow-xl shadow-black/30">
+                  <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 sm:gap-4 mb-4 sm:mb-5 md:mb-6">
                     <div>
-                      <p className="text-[10px] font-black uppercase tracking-[0.3em] text-slate-500 mb-2">
+                      <p className="text-[8px] sm:text-[9px] md:text-[10px] font-black uppercase tracking-[0.25em] sm:tracking-[0.27em] md:tracking-[0.3em] text-slate-500 mb-1 sm:mb-2">
                         Session Archive
                       </p>
-                      <h3 className="text-2xl font-black italic tracking-tighter text-white">
+                      <h3 className="text-lg sm:text-xl md:text-2xl font-black italic tracking-tighter text-white">
                         History Sesi
                       </h3>
                     </div>
 
-                    <div className="px-4 py-2 rounded-full bg-white/5 border border-white/10">
-                      <span className="text-[10px] font-black uppercase tracking-[0.22em] text-slate-400">
-                        {sessionHistory.length} archived sessions
+                    <div className="px-3 sm:px-4 py-2 rounded-full bg-white/5 border border-white/10 shrink-0">
+                      <span className="text-[8px] sm:text-[9px] md:text-[10px] font-black uppercase tracking-[0.2em] sm:tracking-[0.22em] text-slate-400">
+                        {sessionHistory.length} sessions
                       </span>
                     </div>
                   </div>
 
                   {sessionHistory.length > 0 ? (
-                    <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-6">
+                    <div className="max-h-80 sm:max-h-90 md:max-h-96 overflow-y-auto pr-2 sm:pr-3 space-y-2 sm:space-y-3 custom-scrollbar">
                       {sessionHistory.map((session: any) => (
                         <button
                           key={session.id}
                           onClick={() => getSessionDetails(session.id)}
-                          className="group text-left rounded-4xl border border-white/8 bg-linear-to-br from-white/5 to-white/2 p-6 hover:border-white/15 hover:bg-white/5 transition-all hover:-translate-y-1"
+                          className="group w-full text-left rounded-lg sm:rounded-2xl border border-white/10 bg-linear-to-r from-white/5 to-white/0 p-3 sm:p-4 hover:border-purple-400/30 hover:bg-white/8 transition-all hover:shadow-lg hover:shadow-purple-500/10"
                         >
-                          <div className="flex items-center justify-between gap-3 mb-5">
-                            <p className="text-[10px] font-black uppercase tracking-[0.26em] text-slate-500">
-                              Session
-                            </p>
-                            <span className="px-3 py-1 rounded-full bg-green-500/10 border border-green-500/20 text-[8px] font-black text-green-400 uppercase tracking-[0.18em]">
+                          <div className="flex items-start justify-between gap-2 sm:gap-3 mb-1 sm:mb-2">
+                            <div className="min-w-0 flex-1">
+                              <h4 className="text-xs sm:text-sm font-black italic tracking-tighter text-white truncate group-hover:text-purple-300 transition-colors">
+                                {session.title}
+                              </h4>
+                              <span className="text-[7px] sm:text-[8px] font-black uppercase tracking-[0.15em] sm:tracking-[0.16em] text-slate-500 mt-0.5 sm:mt-1 inline-block">
+                                {new Date(
+                                  session.started_at,
+                                ).toLocaleDateString("id-ID", {
+                                  day: "numeric",
+                                  month: "short",
+                                  year: "numeric",
+                                  timeZone: "Asia/Jakarta",
+                                })}
+                              </span>
+                            </div>
+                            <span className="px-2 py-1 rounded-full bg-green-500/15 border border-green-500/25 text-[8px] font-black text-green-400 uppercase tracking-[0.15em] shrink-0">
                               {session.status}
                             </span>
                           </div>
 
-                          <h4 className="text-xl font-black italic tracking-tighter text-white mb-5 line-clamp-2 group-hover:text-purple-300 transition-colors">
-                            {session.title}
-                          </h4>
-
-                          <div className="space-y-3 mb-6">
-                            <div className="flex items-center justify-between gap-3">
-                              <span className="text-[10px] font-black uppercase tracking-[0.18em] text-slate-500">
-                                Mulai
-                              </span>
-                              <span className="text-xs font-bold text-slate-300 text-right">
-                                {formatDateTime(session.started_at)}
-                              </span>
-                            </div>
-
-                            <div className="flex items-center justify-between gap-3">
-                              <span className="text-[10px] font-black uppercase tracking-[0.18em] text-slate-500">
-                                Selesai
-                              </span>
-                              <span className="text-xs font-bold text-slate-300 text-right">
-                                {formatDateTime(session.ended_at)}
-                              </span>
-                            </div>
-                          </div>
-
-                          <div className="pt-4 border-t border-white/6 flex items-center justify-between">
-                            <span className="text-[10px] font-black uppercase tracking-[0.18em] text-slate-500">
-                              Lihat Detail
+                          <div className="flex items-center justify-between gap-3 text-[9px]">
+                            <span className="text-slate-500">
+                              {new Date(session.started_at).toLocaleTimeString(
+                                "id-ID",
+                                {
+                                  hour: "2-digit",
+                                  minute: "2-digit",
+                                  timeZone: "Asia/Jakarta",
+                                },
+                              )}
+                              {" - "}
+                              {session.ended_at
+                                ? new Date(session.ended_at).toLocaleTimeString(
+                                    "id-ID",
+                                    {
+                                      hour: "2-digit",
+                                      minute: "2-digit",
+                                      timeZone: "Asia/Jakarta",
+                                    },
+                                  )
+                                : "-"}
                             </span>
                             <svg
-                              className="w-4 h-4 text-purple-400 group-hover:translate-x-1 transition-transform"
+                              className="w-3 h-3 text-purple-400 group-hover:translate-x-0.5 transition-transform shrink-0"
                               fill="none"
                               stroke="currentColor"
                               viewBox="0 0 24 24"
@@ -1179,37 +1332,36 @@ export default function AdminPage() {
                       ))}
                     </div>
                   ) : (
-                    <div className="rounded-4xl border border-white/8 bg-white/3 p-10 text-center">
-                      <p className="text-[10px] font-black uppercase tracking-[0.3em] text-slate-500 mb-4">
+                    <div className="rounded-lg sm:rounded-2xl border border-white/10 bg-white/2 p-4 sm:p-5 md:p-6 text-center">
+                      <p className="text-[8px] sm:text-[9px] md:text-[10px] font-black uppercase tracking-[0.25em] sm:tracking-[0.27em] md:tracking-[0.3em] text-slate-500 mb-1 sm:mb-2">
                         History Kosong
                       </p>
-                      <h3 className="text-3xl font-black italic tracking-tighter text-white mb-3">
+                      <h3 className="text-sm sm:text-base md:text-lg font-black italic tracking-tighter text-slate-400">
                         Belum Ada Sesi Selesai
                       </h3>
-                      <p className="text-slate-500 max-w-xl mx-auto">
-                        Semua sesi yang telah diselesaikan akan muncul di sini
-                        dengan detail lengkap.
+                      <p className="text-slate-500 text-[7px] sm:text-[8px] md:text-[9px] max-w-md mx-auto mt-1 sm:mt-2">
+                        Sesi yang telah diselesaikan akan muncul di sini.
                       </p>
                     </div>
                   )}
                 </div>
               </div>
             ) : (
-              <div className="space-y-8 animate-in fade-in duration-500">
-                <div className="relative w-full rounded-[3rem] overflow-hidden border border-white/10 bg-white/2">
+              <div className="space-y-6 sm:space-y-8 animate-in fade-in duration-500">
+                <div className="relative w-full rounded-xl sm:rounded-2xl md:rounded-3xl lg:rounded-[3rem] overflow-hidden border border-white/10 bg-white/2">
                   <div className="relative w-full flex items-center justify-center">
                     <Image
                       src="/foto.jpg"
                       alt="Crazy Spirit"
                       width={1200}
                       height={800}
-                      className="object-contain"
+                      className="object-contain w-full h-auto"
                     />
                   </div>
                 </div>
 
-                <div className="p-8 bg-white/2 rounded-4xl border border-white/5 text-center">
-                  <p className="text-gray-400 text-sm font-bold">
+                <div className="p-4 sm:p-6 md:p-8 bg-white/2 rounded-2xl sm:rounded-3xl lg:rounded-4xl border border-white/5 text-center">
+                  <p className="text-slate-400 text-[8px] sm:text-xs md:text-sm font-bold">
                     Tampilan Galeri Crazy Spirit - Upload foto.jpg ke folder
                     public
                   </p>
@@ -1349,17 +1501,37 @@ export default function AdminPage() {
                   </p>
                 </div>
 
+                {/* Photo Link Input */}
+                <div className="mb-8 p-6 rounded-3xl border border-white/15 bg-linear-to-br from-white/8 to-white/3 shadow-lg shadow-white/5">
+                  <label className="text-[10px] font-black uppercase tracking-[0.3em] text-slate-400 mb-3 block">
+                    📸 Link Foto Customer
+                  </label>
+                  <input
+                    type="url"
+                    placeholder="https://drive.google.com/... atau link foto lainnya"
+                    value={photoLink}
+                    onChange={(e) => setPhotoLink(e.target.value)}
+                    className="w-full rounded-2xl border border-white/15 bg-linear-to-br from-white/5 to-white/2 px-6 py-4 text-white font-semibold outline-none placeholder:text-slate-600 focus:border-green-400 focus:bg-white/10 focus:shadow-lg focus:shadow-green-500/20 transition-all text-sm"
+                  />
+                  <p className="text-[9px] text-slate-500 mt-3 leading-relaxed">
+                    Masukkan link foto untuk dikirim ke customer. Link akan
+                    ditampilkan dalam pesan WhatsApp.
+                  </p>
+                </div>
+
                 <div className="space-y-4 mb-8 max-h-115 overflow-y-auto pr-2">
                   <button
                     onClick={() => {
                       const msg = whatsAppTemplates.selesai(
                         whatsAppData.name,
                         whatsAppData.queueNumber,
+                        photoLink,
                       );
                       sendWhatsApp(whatsAppData.phone, msg);
                       setIsWhatsAppModalOpen(false);
+                      setPhotoLink("");
                     }}
-                    className="group w-full rounded-[1.8rem] border border-white/8 bg-white/3 p-5 text-left transition-all hover:bg-green-500/10 hover:border-green-500/30"
+                    className="group w-full rounded-[1.8rem] border border-white/8 bg-linear-to-br from-white/3 to-white/1 p-5 text-left transition-all hover:bg-green-500/10 hover:border-green-500/30"
                   >
                     <div className="flex items-start justify-between gap-4">
                       <div>
@@ -1404,11 +1576,13 @@ export default function AdminPage() {
                       const msg = whatsAppTemplates.next_turn(
                         whatsAppData.name,
                         whatsAppData.queueNumber,
+                        photoLink,
                       );
                       sendWhatsApp(whatsAppData.phone, msg);
                       setIsWhatsAppModalOpen(false);
+                      setPhotoLink("");
                     }}
-                    className="group w-full rounded-[1.8rem] border border-white/8 bg-white/3 p-5 text-left transition-all hover:bg-blue-500/10 hover:border-blue-500/30"
+                    className="group w-full rounded-[1.8rem] border border-white/8 bg-linear-to-br from-white/3 to-white/1 p-5 text-left transition-all hover:bg-blue-500/10 hover:border-blue-500/30"
                   >
                     <div className="flex items-start justify-between gap-4">
                       <div>
@@ -1447,11 +1621,13 @@ export default function AdminPage() {
                       const msg = whatsAppTemplates.reminder(
                         whatsAppData.name,
                         whatsAppData.queueNumber,
+                        photoLink,
                       );
                       sendWhatsApp(whatsAppData.phone, msg);
                       setIsWhatsAppModalOpen(false);
+                      setPhotoLink("");
                     }}
-                    className="group w-full rounded-[1.8rem] border border-white/8 bg-white/3 p-5 text-left transition-all hover:bg-yellow-500/10 hover:border-yellow-500/30"
+                    className="group w-full rounded-[1.8rem] border border-white/8 bg-linear-to-br from-white/3 to-white/1 p-5 text-left transition-all hover:bg-yellow-500/10 hover:border-yellow-500/30"
                   >
                     <div className="flex items-start justify-between gap-4">
                       <div>
@@ -1487,7 +1663,10 @@ export default function AdminPage() {
                 </div>
 
                 <button
-                  onClick={() => setIsWhatsAppModalOpen(false)}
+                  onClick={() => {
+                    setIsWhatsAppModalOpen(false);
+                    setPhotoLink("");
+                  }}
                   className="w-full py-4 bg-white/5 hover:bg-red-500/10 hover:text-red-400 border border-white/5 rounded-2xl font-black text-[10px] uppercase tracking-[0.3em] transition-all duration-300"
                 >
                   Batal
@@ -1608,10 +1787,13 @@ export default function AdminPage() {
         )}
       </div>
 
-      <div className="w-full bg-black/50 border-t border-white/5 py-6 px-8 flex items-center justify-center">
+      <div className="w-full bg-linear-to-t from-slate-950/80 to-slate-950/40 border-t border-white/5 py-6 px-8 flex items-center justify-center shadow-2xl shadow-black/50">
         <p className="text-[10px] font-black uppercase tracking-[0.2em] text-slate-500">
-          Copyright © 2026 <span className="text-purple-400">ryhnar25</span>,
-          All rights reserved
+          Copyright © 2026{" "}
+          <span className="bg-linear-to-r from-purple-400 to-blue-400 bg-clip-text text-transparent">
+            ryhnar25
+          </span>
+          , All rights reserved
         </p>
       </div>
     </div>
@@ -1628,7 +1810,7 @@ function DetailCard({
   icon: string;
 }) {
   return (
-    <div className="rounded-3xl border border-white/8 bg-white/3 p-4 hover:bg-white/5 transition-all">
+    <div className="rounded-2xl border border-white/15 bg-linear-to-br from-white/8 to-white/3 p-4 hover:shadow-lg hover:shadow-white/10 hover:border-white/25 transition-all duration-300">
       <div className="flex items-center gap-2 mb-2">
         <span className="text-lg">{icon}</span>
         <p className="text-[9px] font-black uppercase tracking-[0.22em] text-slate-500">
@@ -1652,12 +1834,15 @@ function SidebarTab({
   return (
     <button
       onClick={onClick}
-      className={`w-full text-left px-5 py-4 rounded-2xl text-[10px] font-black uppercase tracking-[0.24em] transition-all ${
+      className={`w-full text-left px-5 py-4 rounded-2xl text-[10px] font-black uppercase tracking-[0.24em] transition-all duration-300 relative overflow-hidden group ${
         active
-          ? "bg-linear-to-r from-purple-600 to-blue-600 text-white shadow-lg shadow-purple-900/25"
-          : "text-gray-500 bg-white/0 hover:bg-white/5 hover:text-white"
+          ? "bg-linear-to-r from-purple-600/80 to-blue-600/60 text-white shadow-lg shadow-purple-900/40"
+          : "text-slate-400 bg-white/0 hover:bg-white/5 hover:text-white hover:shadow-md hover:shadow-white/5"
       }`}
     >
+      <div
+        className={`absolute inset-0 bg-linear-to-r from-transparent via-white/10 to-transparent -translate-x-full ${active ? "group-hover:translate-x-full" : ""} transition-transform duration-500 pointer-events-none`}
+      />
       {label}
     </button>
   );
@@ -1665,8 +1850,8 @@ function SidebarTab({
 
 function SessionInfo({ label, value }: { label: string; value: string }) {
   return (
-    <div className="rounded-3xl border border-white/8 bg-white/3 p-4">
-      <p className="text-[10px] font-black uppercase tracking-[0.24em] text-slate-500 mb-2">
+    <div className="rounded-2xl border border-white/15 bg-linear-to-br from-white/10 to-white/5 p-4 shadow-lg shadow-white/5">
+      <p className="text-[10px] font-black uppercase tracking-[0.24em] text-slate-400 mb-2">
         {label}
       </p>
       <p className="text-sm font-black text-white leading-relaxed">{value}</p>
@@ -1683,20 +1868,42 @@ function StatCard({
   value: string | number;
   tone: "green" | "emerald" | "sky";
 }) {
-  const tones: Record<string, string> = {
-    green: "from-green-500/20 to-green-500/5 border-green-500/20",
-    emerald: "from-emerald-500/20 to-emerald-500/5 border-emerald-500/20",
-    sky: "from-sky-500/20 to-sky-500/5 border-sky-500/20",
+  const tones: Record<
+    string,
+    { gradient: string; shadow: string; icon: string }
+  > = {
+    green: {
+      gradient: "from-green-600/30 to-green-600/10 border-green-500/20",
+      shadow: "shadow-green-500/20",
+      icon: "✓",
+    },
+    emerald: {
+      gradient: "from-emerald-600/30 to-emerald-600/10 border-emerald-500/20",
+      shadow: "shadow-emerald-500/20",
+      icon: "💰",
+    },
+    sky: {
+      gradient: "from-sky-600/30 to-sky-600/10 border-sky-500/20",
+      shadow: "shadow-sky-500/20",
+      icon: "📊",
+    },
   };
+
+  const tone_config = tones[tone];
 
   return (
     <div
-      className={`rounded-4xl border bg-linear-to-br p-8 md:p-10 ${tones[tone]}`}
+      className={`rounded-2xl sm:rounded-3xl border bg-linear-to-br p-4 sm:p-5 md:p-6 lg:p-8 shadow-xl ${tone_config.shadow} hover:shadow-2xl transition-all duration-300 group cursor-default ${tone_config.gradient}`}
     >
-      <p className="text-[10px] font-black uppercase tracking-[0.3em] text-slate-500 mb-4">
-        {title}
-      </p>
-      <p className="text-4xl md:text-5xl font-black tracking-tighter text-white leading-none">
+      <div className="flex items-center justify-between mb-2 sm:mb-3 md:mb-4">
+        <p className="text-[8px] sm:text-[9px] md:text-[10px] font-black uppercase tracking-[0.25em] sm:tracking-[0.28em] md:tracking-[0.3em] text-slate-500">
+          {title}
+        </p>
+        <span className="text-lg sm:text-xl md:text-2xl opacity-0 group-hover:opacity-100 transition-opacity">
+          {tone_config.icon}
+        </span>
+      </div>
+      <p className="text-2xl sm:text-3xl md:text-4xl lg:text-5xl font-black tracking-tighter text-white leading-none">
         {value}
       </p>
     </div>
@@ -1718,26 +1925,39 @@ function Column({
     color === "blue"
       ? "text-blue-400"
       : color === "green"
-        ? "text-green-500"
+        ? "text-green-400"
         : color === "orange"
-          ? "text-orange-500"
+          ? "text-orange-400"
           : color === "purple"
             ? "text-purple-400"
-            : "text-gray-500";
+            : "text-slate-400";
+
+  const colorBg =
+    color === "blue"
+      ? "from-blue-500/10 to-blue-500/0 border-blue-500/15"
+      : color === "green"
+        ? "from-green-500/10 to-green-500/0 border-green-500/15"
+        : color === "orange"
+          ? "from-orange-500/10 to-orange-500/0 border-orange-500/15"
+          : color === "purple"
+            ? "from-purple-500/10 to-purple-500/0 border-purple-500/15"
+            : "from-white/5 to-white/0 border-white/10";
 
   return (
-    <section className="rounded-4xl border border-white/5 bg-white/2 p-5 space-y-5">
-      <div className="flex items-center justify-between border-b border-white/5 pb-4 px-1">
+    <section
+      className={`rounded-2xl sm:rounded-3xl border bg-linear-to-br ${colorBg} p-3 sm:p-4 md:p-5 space-y-3 sm:space-y-4 md:space-y-5 shadow-xl shadow-black/30 hover:shadow-xl hover:shadow-white/5 transition-all duration-300`}
+    >
+      <div className="flex items-center justify-between border-b border-white/5 pb-3 sm:pb-4 px-0 sm:px-1">
         <h2
-          className={`text-[11px] font-black uppercase tracking-[0.28em] ${textColor}`}
+          className={`text-[9px] sm:text-[10px] md:text-[11px] font-black uppercase tracking-[0.25em] sm:tracking-[0.27em] md:tracking-[0.28em] ${textColor}`}
         >
           {title}
         </h2>
-        <span className="bg-white/5 border border-white/10 px-3 py-1 rounded-lg text-[9px] font-bold text-gray-400 leading-none">
+        <span className="bg-white/10 border border-white/15 px-2 sm:px-3 py-0.5 sm:py-1 rounded-lg text-[7px] sm:text-[8px] md:text-[9px] font-bold text-slate-300 leading-none shadow-lg shadow-white/5">
           {count}
         </span>
       </div>
-      <div className="space-y-4">{children}</div>
+      <div className="space-y-2 sm:space-y-3 md:space-y-4">{children}</div>
     </section>
   );
 }
@@ -1779,43 +1999,51 @@ function QueueCard({
     : "";
 
   const colors: Record<string, string> = {
-    purple: "border-purple-500/10 bg-purple-500/5",
-    blue: "border-blue-500/10 bg-blue-500/5",
-    yellow: "border-yellow-500/10 bg-yellow-500/5",
-    green: "border-green-500/10 bg-green-500/5",
-    orange: "border-orange-500/10 bg-orange-500/5",
-    gray: "border-white/10 bg-white/3",
+    purple:
+      "border-purple-500/20 bg-linear-to-br from-purple-500/15 to-purple-500/5 hover:shadow-purple-500/20",
+    blue: "border-blue-500/20 bg-linear-to-br from-blue-500/15 to-blue-500/5 hover:shadow-blue-500/20",
+    yellow:
+      "border-yellow-500/20 bg-linear-to-br from-yellow-500/15 to-yellow-500/5 hover:shadow-yellow-500/20",
+    green:
+      "border-green-500/20 bg-linear-to-br from-green-500/15 to-green-500/5 hover:shadow-green-500/20",
+    orange:
+      "border-orange-500/20 bg-linear-to-br from-orange-500/15 to-orange-500/5 hover:shadow-orange-500/20",
+    gray: "border-white/15 bg-linear-to-br from-white/8 to-white/2 hover:shadow-white/10",
   };
 
   return (
     <div
-      className={`border transition-all duration-300 ${
-        compact ? "p-3 rounded-3xl" : "p-6 rounded-4xl"
+      className={`border transition-all duration-300 shadow-lg shadow-black/30 hover:shadow-xl hover:-translate-y-1 ${
+        compact
+          ? "p-2 sm:p-3 rounded-xl sm:rounded-2xl"
+          : "p-4 sm:p-5 md:p-6 rounded-2xl sm:rounded-3xl"
       } ${colors[color] || colors.gray}`}
     >
       <div
-        className={`flex justify-between items-start ${compact ? "mb-4" : "mb-5"} gap-3`}
+        className={`flex justify-between items-start ${compact ? "mb-3 sm:mb-4" : "mb-4 sm:mb-5"} gap-2 sm:gap-3`}
       >
         <div>
           <h3
-            className={`font-black italic tracking-tighter bg-clip-text text-transparent bg-linear-to-b from-white to-gray-600 leading-none ${
-              compact ? "text-2xl mb-1" : "text-4xl mb-2"
+            className={`font-black italic tracking-tighter bg-clip-text text-transparent bg-linear-to-b from-white to-slate-300 leading-none ${
+              compact
+                ? "text-xl sm:text-2xl mb-0.5 sm:mb-1"
+                : "text-3xl sm:text-4xl mb-1 sm:mb-2"
             }`}
           >
             #{q.queue_number}
           </h3>
-          <p className="text-[10px] font-black text-gray-500 uppercase tracking-[0.22em] truncate max-w-36">
+          <p className="text-[8px] sm:text-[9px] md:text-[10px] font-black text-slate-400 uppercase tracking-[0.2em] sm:tracking-[0.22em] truncate max-w-32 sm:max-w-36">
             {userName}
           </p>
         </div>
 
-        <div className="text-right">
+        <div className="text-right shrink-0">
           {q.price ? (
-            <p className="text-[11px] font-black text-green-400 tracking-tight">
+            <p className="text-[9px] sm:text-[10px] md:text-[11px] font-black text-green-300 tracking-tight">
               Rp {q.price.toLocaleString("id-ID")}
             </p>
           ) : isSelesai ? (
-            <span className="text-[10px] text-white/20 italic font-bold">
+            <span className="text-[8px] sm:text-[9px] md:text-[10px] text-slate-600 italic font-bold">
               UNPAID
             </span>
           ) : null}
@@ -1826,14 +2054,14 @@ function QueueCard({
         <button
           onClick={onAction}
           disabled={isLoading}
-          className={`w-full py-3 rounded-2xl text-[10px] font-black uppercase tracking-[0.22em] transition-all disabled:opacity-50 disabled:cursor-not-allowed ${
+          className={`w-full py-2 sm:py-3 rounded-lg sm:rounded-2xl text-[8px] sm:text-[9px] md:text-[10px] font-black uppercase tracking-[0.2em] sm:tracking-[0.22em] transition-all disabled:opacity-50 disabled:cursor-not-allowed shadow-lg active:scale-95 ${
             color === "yellow"
-              ? "bg-yellow-500 text-black shadow-lg shadow-yellow-900/10 animate-pulse"
+              ? "bg-linear-to-r from-yellow-500 to-yellow-600 text-black shadow-yellow-500/50 animate-pulse hover:shadow-lg"
               : color === "orange"
-                ? "bg-orange-500 text-white hover:bg-orange-600"
+                ? "bg-linear-to-r from-orange-500 to-orange-600 text-white hover:shadow-lg hover:shadow-orange-500/30"
                 : color === "blue"
-                  ? "bg-blue-500/20 text-blue-200 hover:bg-blue-500/30"
-                  : "bg-white/10 text-white hover:bg-white/20"
+                  ? "bg-linear-to-r from-blue-600/80 to-blue-700/60 text-blue-100 hover:shadow-lg hover:shadow-blue-500/30"
+                  : "bg-linear-to-r from-white/15 to-white/10 text-white hover:shadow-lg hover:shadow-white/20"
           }`}
         >
           {isLoading ? "Processing..." : label}
@@ -1850,9 +2078,9 @@ function QueueCard({
             });
             setIsWhatsAppModalOpen(true);
           }}
-          className="w-full py-3 bg-green-500/10 text-green-500 border border-green-500/20 rounded-2xl text-[9px] font-black uppercase tracking-[0.2em] hover:bg-green-500 hover:text-white transition-all"
+          className="w-full py-3 bg-linear-to-r from-green-600/40 to-green-700/30 text-green-300 border border-green-500/30 rounded-2xl text-[9px] font-black uppercase tracking-[0.2em] hover:from-green-600 hover:to-green-700 hover:text-white hover:border-green-500/60 transition-all shadow-lg shadow-green-500/20"
         >
-          Resend WhatsApp 
+          Resend WhatsApp
         </button>
       )}
 
@@ -1860,7 +2088,7 @@ function QueueCard({
         <button
           onClick={() => onDelete(q.id)}
           disabled={isLoading}
-          className="w-full mt-3 py-2.5 bg-red-500/10 text-red-500 border border-red-500/20 rounded-2xl text-[8px] font-black uppercase tracking-[0.2em] hover:bg-red-500 hover:text-white transition-all disabled:opacity-50 disabled:cursor-not-allowed"
+          className="w-full mt-3 py-2.5 bg-red-500/10 text-red-400 border border-red-500/25 rounded-2xl text-[8px] font-black uppercase tracking-[0.2em] hover:bg-red-500/20 hover:text-red-300 hover:border-red-500/40 transition-all shadow-lg shadow-red-500/10 disabled:opacity-50 disabled:cursor-not-allowed"
         >
           {isLoading ? "Deleting..." : "Delete"}
         </button>
@@ -1870,12 +2098,12 @@ function QueueCard({
 }
 
 const whatsAppTemplates = {
-  selesai: (name: string, queueNumber: number) =>
-    `Halo ${name} \n\nTerimakasih telah berkunjung dan silahkan ambil foto kamu!\n\nNomor antrian: ${queueNumber}\n\nSayunk Photobooth `,
-  next_turn: (name: string, queueNumber: number) =>
-    `Halo ${name} \n\nJangan lupa follow instagram dan tik tok kami @sayunk_photobooth.\n\nNomor antrian: ${queueNumber}\n\nSayunk Photobooth `,
-  reminder: (name: string, queueNumber: number) =>
-    `Halo ${name} \n\nBuah stoberi buah ceri jangan lupa kembali lagiiiii \n\nNomor antrian: ${queueNumber}\n\nSayunk Photobooth `,
+  selesai: (name: string, queueNumber: number, photoLink: string = "") =>
+    `Halo ${name} 👋\n\nTerimakasih telah berkunjung dan silahkan ambil foto kamu! 📸\n\nNomor antrian: ${queueNumber}${photoLink ? `\n\n📷 Link Foto:\n${photoLink}` : ""}\n\nSayunk Photobooth ✨`,
+  next_turn: (name: string, queueNumber: number, photoLink: string = "") =>
+    `Halo ${name} 👋\n\nJangan lupa follow instagram dan tik tok kami @sayunk_photobooth 📱\n\nNomor antrian: ${queueNumber}${photoLink ? `\n\n📷 Link Foto:\n${photoLink}` : ""}\n\nSayunk Photobooth ✨`,
+  reminder: (name: string, queueNumber: number, photoLink: string = "") =>
+    `Halo ${name} 👋\n\nBuah stoberi buah ceri jangan lupa kembali lagiiiii 🍓🍒\n\nNomor antrian: ${queueNumber}${photoLink ? `\n\n📷 Link Foto:\n${photoLink}` : ""}\n\nSayunk Photobooth ✨`,
 };
 
 const sendWhatsApp = (phone: string, message: string) => {
